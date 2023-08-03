@@ -1,11 +1,19 @@
 
-# import torch
+import torch
 from random import shuffle
 import torch.nn as nn
 from math import prod
 # import torch.nn.functional as nnf
 from .building_blocks import activation_fn, ResBlock
 from einops.layers.torch import Rearrange
+
+from monai.apps.reconstruction.networks.nets.utils import (
+    complex_normalize,
+    divisible_pad_t,
+    inverse_divisible_pad_t,
+    reshape_channel_complex_to_last_dim,
+    reshape_complex_to_channel_dim,
+)
 
 class EDSR(nn.Module):
     def __init__(self, dimension, n_resblocks, n_feats, in_channels=1, out_channels=1, act='gelu'):
@@ -36,6 +44,8 @@ class EDSR(nn.Module):
         self.tail = nn.Sequential(*m_tail)
 
     def forward(self, x):
+        x = reshape_complex_to_channel_dim(torch.view_as_real(x))  # x will be of shape (B,C*2,H,W)
+        x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
         x = self.head(x)
 
         res = self.body(x)
@@ -43,7 +53,9 @@ class EDSR(nn.Module):
 
         x = self.tail(res)
 
-        return x
+        x = x * std + mean
+        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
+        return torch.view_as_complex(x.contiguous())
 
 
 class ShuffleEDSR(nn.Module):
