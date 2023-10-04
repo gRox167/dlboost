@@ -76,7 +76,7 @@ def to_gif(path, input_array, is_segmentation=False):
     
 def to_png(path, input_array,vmin=None,vmax=None):
     if input_array.dtype == torch.float32:
-        plt.imsave(path,input_array.clone().detach().cpu().numpy(),vmin=vmin,vmax=vmax)
+        plt.imsave(path,input_array.clone().detach().cpu().numpy(),vmin=vmin,vmax=vmax, cmap='gray')
     elif input_array.dtype == torch.complex64:
-        plt.imsave(path,input_array.clone().detach().cpu().abs().numpy(),vmin=vmin,vmax=vmax)
+        plt.imsave(path,input_array.clone().detach().cpu().abs().numpy(),vmin=vmin,vmax=vmax, cmap='gray')
     # plt.imsave('tests/image_recon_fixed_cache_filled_wrap.png',image_recon_fixed_cache[0,40,:,:].abs().cpu())

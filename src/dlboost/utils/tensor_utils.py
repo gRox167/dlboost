@@ -36,3 +36,14 @@ def fft2(x):
     return x_
 
 
+def normalize(x, return_mean_std=False):
+    mean = x.mean()
+    std = x.std()
+    if return_mean_std:
+        return (x-mean)/std, mean, std
+    else:
+        return (x-mean)/std
+
+
+def renormalize(x, mean, std):
+    return x*std+mean

@@ -42,7 +42,6 @@ class Transformer(nn.Module):
 
     def forward(self, src, src_pos, out_pos):
         """
-
         Args:
           src: [bs, src_len, c] intensity of sampled points
           lr_pos: [bs, lh*lw, 2] normalized coordinates of LR query points
@@ -52,9 +51,7 @@ class Transformer(nn.Module):
           mask: [bs, h, w, c] undersampling mask, 1 means unsampled and 0 means sampled
           unsampled_pos: [bs, query_len, 2] coordinates of unsampled points(unnormalized)
           up_scale: LR upsample ratio to HR
-
         Returns:
-
         """
         # encoder
         src_embed = self.encoder_embedding_layer(src)

@@ -22,19 +22,7 @@ from mrboost import computation as comp
 from dlboost.models.SpatialTransformNetwork import SpatialTransformNetwork
 from dlboost import losses
 from dlboost.utils import complex_as_real_2ch, real_2ch_as_complex, complex_as_real_ch, to_png
-
-
-def normalize(x, return_mean_std=False):
-    mean = x.mean()
-    std = x.std()
-    if return_mean_std:
-        return (x-mean)/std, mean, std
-    else:
-        return (x-mean)/std
-
-
-def renormalize(x, mean, std):
-    return x*std+mean
+from dlboost.tasks.boilerplate import *
 
 
 class Recon(pl.LightningModule):
@@ -84,19 +72,9 @@ class Recon(pl.LightningModule):
         lambda_ = self.lambda_init + 0.00028125 * \
             self.global_step * kspace_data.shape[0]
         # generate a random discrete set for the kspace data
-        rand_perm = torch.split(torch.randperm(kspace_data.shape[-2]), 3)
-        assert kspace_data.shape[-2] == 15
-        assert len(rand_perm) == 5
-        masks = []
-        for perm in rand_perm:
-            mask_base = torch.tensor([False]*15, device=kspace_traj.device)
-            mask_base[perm] = True
-            masks.append(mask_base)
-        # masks = [ for perm in rand_perm]
-        # mask = torch.tensor([True]*3+[False]*12, device=kspace_traj.device)
-        # mask = mask[torch.randperm(mask.nelement())]
-        # masks = [mask[torch.randperm(mask.nelement())] for i in range(5)]
+        masks = generate_disjoint_masks(kspace_data_compensated.shape[-2], [3]*5, kspace_data_compensated.device)
         reverse_masks = [torch.logical_not(m) for m in masks]
+
         kspace_data_compensated_masked_list = [
             eo.rearrange(kspace_data_compensated[..., mask, :], "b ph z sp len -> b ph z (sp len)") for mask in reverse_masks]
         # kspace_data_masked_list = [kspace_data[..., mask] for mask in masks]
@@ -108,56 +86,52 @@ class Recon(pl.LightningModule):
         image_init, image_recon = None, None
         for k_compensated, k_traj, mask in zip(kspace_data_compensated_masked_list, kspace_traj_masked_list, masks):
             # print(k_compensated.shape, k_traj.shape)
-            image_init = self.nufft_adj_fn(k_compensated,
-                                           k_traj)
+            image_init = nufft_adj_fn(k_compensated, k_traj, self.nufft_adj)
             image_recon = self.forward(image_init)
-            kspace_data_estimated = self.nufft_fn(image_recon,
-                                                  eo.rearrange(kspace_traj[..., mask, :], "b ph z sp len -> b ph z (sp len)"))
+            kspace_data_estimated = nufft_fn(image_recon,
+                                                  eo.rearrange(kspace_traj[..., mask, :], "b ph z sp len -> b ph z (sp len)"),
+                                                  self.nufft_op)
             kspace_data_estimated_blind[..., mask, :] = eo.rearrange(
                 kspace_data_estimated, "b ph z (sp len) -> b ph z sp len", sp=torch.sum(mask))
         with torch.no_grad():
-            image_init_unblind = self.nufft_adj_fn(
+            image_init_unblind = nufft_adj_fn(
                 eo.rearrange(kspace_data_compensated,
                              "b ph z sp len -> b ph z (sp len)"),
-                eo.rearrange(kspace_traj, "b ph z sp len -> b ph z (sp len)"))
+                eo.rearrange(kspace_traj, "b ph z sp len -> b ph z (sp len)"),
+                self.nufft_adj)
             image_recon_unblind = self.forward(image_init_unblind)
-            kspace_data_estimated_unblind = self.nufft_fn(
+            kspace_data_estimated_unblind = nufft_fn(
                 image_recon_unblind,
-                eo.rearrange(kspace_traj, "b ph c sp len -> b ph c (sp len)"))
+                eo.rearrange(kspace_traj, "b ph c sp len -> b ph c (sp len)"),
+                self.nufft_op)
             kspace_data_estimated_unblind = eo.rearrange(
                 kspace_data_estimated_unblind, "b ph z (sp len) -> b ph z sp len", sp=kspace_data.shape[-2])
 
-        # weight = batch["kspace_density_compensation"] * 1e4
-        # weight = weight**self.weight_coef
+        # weight = torch.arange(1, kspace_data.shape[-1]//2+1, device=kspace_data.device)
+        # weight_reverse_sample_density = torch.cat([weight.flip(0),weight], dim=0)
         
-        loss_revisit_k = (torch.view_as_real(kspace_data_estimated_blind) + \
-            lambda_ * torch.view_as_real(kspace_data_estimated_unblind)
-        - (lambda_+1) * torch.view_as_real(kspace_data))**2
-        
-        loss_revisit_k = torch.mean(loss_revisit_k)
+        diff_revisit_k = (kspace_data_estimated_blind + \
+            lambda_ * kspace_data_estimated_unblind - \
+            (lambda_+1) * kspace_data)
+        # loss_revisit_k = diff_revisit_k*diff_revisit_k.conj() #L2 distance between 2 kspace point is the square of the distance between their real and imaginary part
+        loss_revisit_k = torch.mean(diff_revisit_k.abs())
+
         blind = torch.fft.ifft(kspace_data_estimated_blind, dim=-1, norm='ortho')
         unblind = torch.fft.ifft(kspace_data_estimated_unblind, dim=-1, norm='ortho')
         raw = torch.fft.ifft(kspace_data, dim=-1, norm='ortho')
-        loss_revisit_i = (torch.view_as_real(blind) + \
-            lambda_ * torch.view_as_real(unblind)
-        - (lambda_+1) * torch.view_as_real(raw))**2
-        loss_revisit_i = torch.mean(loss_revisit_i)
+        diff_revisit_i = blind + lambda_ * unblind - (lambda_+1) * raw
+        # loss_revisit_i = diff_revisit_i*diff_revisit_i.conj() 
+        loss_revisit_i = torch.mean(diff_revisit_i.abs())
+
         loss_revisit = loss_revisit_k + loss_revisit_i
         
-        # loss_revisit = (torch.view_as_real(kspace_data_estimated_blind)
-        #      + lambda_ * torch.view_as_real(kspace_data_estimated_unblind)
-        #      - (lambda_+1) * torch.view_as_real(kspace_data))**2
-        # loss_revisit = torch.mean(loss_revisit)
-        loss_reg_k = self.eta * (torch.view_as_real(kspace_data_estimated_blind)
-                                        -torch.view_as_real(kspace_data_estimated_unblind))**2
-        loss_reg_k = torch.mean(loss_reg_k)
-        loss_reg_i = self.eta * (torch.view_as_real(blind)
-                                        -torch.view_as_real(unblind))**2
-        loss_reg_i = torch.mean(loss_reg_i)
+        diff_reg_k = (kspace_data_estimated_blind - kspace_data_estimated_unblind)
+        loss_reg_k = self.eta * torch.mean(diff_reg_k.abs())
+        loss_reg_i = blind-unblind 
+        loss_reg_i = self.eta * torch.mean(loss_reg_i.abs())
         loss_reg = loss_reg_k + loss_reg_i
 
-        self.manual_backward(loss_revisit+self.eta *
-                             loss_reg, retain_graph=True)
+        self.manual_backward(loss_revisit+loss_reg, retain_graph=True)
         self.log_dict({"recon/loss_revisit": loss_revisit})
         self.log_dict({"recon/loss_reg": loss_reg})
         self.log_dict({"recon/recon_loss": loss_reg+loss_revisit})
@@ -171,78 +145,8 @@ class Recon(pl.LightningModule):
                        image_recon_unblind[0, i, 0, :, :])  # , vmin=0, vmax=2)
         recon_opt.step()
 
-    # def __training_step_recon(self, image_recon, kspace_traj, kspace_data, w):
-    #     loss_image_space = self.recon_loss_fn(image_recon,image)
-    #     kspace_data_estimated = self.nufft_fn(
-    #         image_recon, kspace_traj)
-    #     loss_not_reduced = \
-    #         self.recon_loss_fn(torch.view_as_real(
-    #             kspace_data_estimated), torch.view_as_real(kspace_data))
-    #     loss_kspace = torch.mean(loss_not_reduced * w.unsqueeze(-1).expand(loss_not_reduced.shape))
-    #     self.log("recon/loss_image_space", loss_image_space)
-    #     self.log("recon/loss_kspace", loss_kspace)
-    #     return loss_image_space + loss_kspace
-
     def validation_step(self, batch, batch_idx):
-        for d in range(batch['cse'].shape[0]):
-            image_recon, image_init = self.forward_contrast(batch["kspace_data_compensated"][d],
-                                                            batch["kspace_traj"][d], batch["cse"][d])
-            break
-        return image_recon, image_init
-
-    def forward_contrast(self, kspace_data_compensated, kspace_traj, cse):
-        image_recon_list, image_init_list = [], []
-        for kspace_data_t, kspace_traj_t in zip(kspace_data_compensated, kspace_traj):
-            recon, init = self.forward_ch(
-                kspace_data_compensated=kspace_data_t, kspace_traj=kspace_traj_t, cse=cse)
-            image_recon_list.append(recon)
-            image_init_list.append(init)
-            break
-        image_recon = torch.stack(image_recon_list)
-        image_init = torch.stack(image_init_list)
-        return image_recon, image_init
-
-    def forward_ch(self, kspace_data_compensated, kspace_traj, cse):
-        # image_recon_list, image_init_list = [],[]
-        kspace_traj_ch = kspace_traj[0]
-        ch = 0
-        image_recon, image_init = 0, 0
-        for kspace_data_ch, cse_ch in zip(kspace_data_compensated, cse):
-            recon, init = self.forward_step(
-                kspace_data_compensated=kspace_data_ch.unsqueeze(0), kspace_traj=kspace_traj_ch.unsqueeze(0), cse=cse_ch.unsqueeze(0))
-            image_recon = image_recon+recon
-            image_init = image_init+init
-            ch += 1
-        # zarr.save(f'tests/B2UKXKY_RandSpoke_UNet/image_recon_.zarr',
-        #           image_recon.abs().numpy(force=True))
-        # zarr.save(f'tests/B2UKXKY_RandSpoke_UNet/image_init_.zarr',
-        #           image_init.abs().numpy(force=True))
-        return image_recon, image_init
-
-    def forward_step(self, kspace_data_compensated, kspace_traj, cse, predictor=None):
-        if predictor == None:
-            predictor = self.recon_module
-        image_init = self.nufft_adj_fn(kspace_data_compensated, kspace_traj)
-        image_recon = sliding_window_inference(
-            image_init, roi_size=self.patch_size,
-            sw_batch_size=32, overlap=0, predictor=predictor)  # , mode='gaussian')
-        return image_recon*cse.conj(), image_init*cse.conj()
-
-    def nufft_fn(self, image, omega):
-        b, ph, c, l = omega.shape
-        image_kx_ky_z = self.nufft_op(  # torch.squeeze(image, dim=1)
-            eo.rearrange(image, "b ph z x y -> (b ph) z x y"),
-            eo.rearrange(omega, "b ph c l -> (b ph) c l"), norm="ortho")
-        image_kx_ky_z = eo.rearrange(
-            image_kx_ky_z, "(b ph) z l -> b ph z l", b=b)
-        # image_kx_ky_z.unsqueeze_(dim=1)
-        return image_kx_ky_z
-
-    def nufft_adj_fn(self, kdata, omega):
-        b, ph, c, l = omega.shape
-        image = self.nufft_adj(eo.rearrange(kdata, "b ph z l -> (b ph) z l"),
-                               eo.rearrange(omega, "b ph c l -> (b ph) c l"), norm="ortho")
-        return eo.rearrange(image, "(b ph) z x y -> b ph z x y", b=b, ph=ph)
+        validation_step(self, batch, batch_idx)
 
     def configure_optimizers(self):
         recon_optimizer = self.recon_optimizer(

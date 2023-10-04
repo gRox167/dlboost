@@ -24,17 +24,6 @@ from dlboost import losses
 from dlboost.utils import complex_as_real_2ch, real_2ch_as_complex, complex_as_real_ch, to_png
 
 
-def normalize(x, return_mean_std=False):
-    mean = x.mean()
-    std = x.std()
-    if return_mean_std:
-        return (x-mean)/std, mean, std
-    else:
-        return (x-mean)/std
-
-
-def renormalize(x, mean, std):
-    return x*std+mean
 
 
 class Recon(pl.LightningModule):

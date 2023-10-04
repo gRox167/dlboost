@@ -53,7 +53,7 @@ def check_top_k_channel(path, k = 5):
 class ONC_DCE_P2PKXKY(LightningDataModule):
     def __init__(
         self,
-        data_dir: os.PathLike = '/data-local/anlab/Chunxu/DL_MOTIF/recon_results_for_P2P/CCIR_01168_ONC-DCE',
+        data_dir: os.PathLike = '/data/anlab/Chunxu/DL_MOTIF/recon_results_for_P2P/CCIR_01168_ONC-DCE',
         patch_size=(20, 320, 320),
         num_samples_per_subject= 16,
         train_batch_size: int = 4,

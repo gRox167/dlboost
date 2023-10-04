@@ -1,53 +1,47 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as f
+import torch.nn.functional as F
 
 class SpatialTransformNetwork(nn.Module):
-    """
-    [SpatialTransformer] represesents a spatial transformation block
-    that uses the output from the UNet to preform an grid_sample
-    https://pytorch.org/docs/stable/nn.functional.html#grid-sample
-    """
 
-    def __init__(self, size, dims=3, mode='bilinear'):
-        """
-        Instiatiate the block
-            :param size: size of input to the spatial transformer block
-            :param mode: method of interpolation for grid_sampler
-        """
+    def __init__(self, size, mode='bilinear'):
         super().__init__()
-
-        # Create sampling grid
-        vectors = [torch.arange(0, s) for s in size]
-        grids = torch.meshgrid(vectors)
-        grid = torch.stack(grids)  # y, x, z
-        grid = torch.unsqueeze(grid, 0)  # add batch
-        grid = grid.type(torch.FloatTensor)
-        self.register_buffer('grid', grid)
-        self.dims = dims
 
         self.mode = mode
 
-    def forward(self, src, flow):
-        """
-        Push the src and flow through the spatial transform block
-            :param src: the original moving image
-            :param flow: the output from the U-Net
-        """
-        new_locs = self.grid + flow
+        # create sampling grid
+        vectors = [torch.arange(0, s) for s in size]
+        grids = torch.meshgrid(vectors)
+        grid = torch.stack(grids)
+        grid = torch.unsqueeze(grid, 0)
+        grid = grid.type(torch.FloatTensor)
 
+        # registering the grid as a buffer cleanly moves it to the GPU, but it also
+        # adds it to the state dict. this is annoying since everything in the state dict
+        # is included when saving weights to disk, so the model files are way bigger
+        # than they need to be. so far, there does not appear to be an elegant solution.
+        # see: https://discuss.pytorch.org/t/how-to-register-buffer-without-polluting-state-dict
+        self.register_buffer('grid', grid)
+
+    def forward(self, src, flow, return_phi=False):
+        # new locations
+        new_locs = self.grid + flow
         shape = flow.shape[2:]
 
-        # Need to normalize grid values to [-1, 1] for resampler
-        for i in range(self.dims):
+        # need to normalize grid values to [-1, 1] for resampler
+        for i in range(len(shape)):
             new_locs[:, i, ...] = 2 * (new_locs[:, i, ...] / (shape[i] - 1) - 0.5)
 
-        if self.dims == 2:
+        # move channels dim to last position
+        # also not sure why, but the channels need to be reversed
+        if len(shape) == 2:
             new_locs = new_locs.permute(0, 2, 3, 1)
             new_locs = new_locs[..., [1, 0]]
-        elif self.dims == 3:
+        elif len(shape) == 3:
             new_locs = new_locs.permute(0, 2, 3, 4, 1)
             new_locs = new_locs[..., [2, 1, 0]]
 
-        # noinspection PyArgumentList
-        return f.grid_sample(src, new_locs, mode=self.mode, align_corners=False)
+        if return_phi:
+            return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode), new_locs
+        else:
+            return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)

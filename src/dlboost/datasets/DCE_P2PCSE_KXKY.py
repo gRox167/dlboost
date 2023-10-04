@@ -19,7 +19,7 @@ from mrboost import computation as comp
 from dlboost.datasets.boilerplate import *
 
 
-class ONC_DCE_DeCoLearn(LightningDataModule):
+class DCE_P2PCSE_KXKY(LightningDataModule):
     def __init__(
         self,
         data_dir: os.PathLike = '/data/anlab/Chunxu/RawData_MR/',
@@ -43,13 +43,13 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
         self.data_dir = Path(data_dir)
-        self.cache_dir = cache_dir / '.DCE_DeCoLearnKXKY_10ph'
+        self.cache_dir = cache_dir / '.DCE_P2PCSE_KXKY_10ph'
         self.num_workers = num_workers
         self.contrast, self.phase = 34, 5
         self.keys = ["kspace_data_z", "kspace_data_z_compensated", "kspace_traj", "kspace_density_compensation"]
         self.val_keys = ["kspace_data_z", "kspace_data_z_compensated", "kspace_traj", "cse"]
-        self.raw_data_list = glob("ONC-DCE-*", root_dir = self.data_dir)
-        self.top_k=5
+        # self.raw_data_list = glob("ONC-DCE-*", root_dir = self.data_dir)
+        # self.top_k=5
 
         self.dat_file_path_list = [
             "CCIR_01168_ONC-DCE/ONC-DCE-003/meas_MID00781_FID11107_CAPTURE_FA15_Dyn.dat",
@@ -84,14 +84,10 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
                 print(p)
                 dat_file_to_recon = Path(self.data_dir)/p
                 raw_data = recon_one_scan(dat_file_to_recon, phase_num=10, time_per_contrast=20)
-                t, ph, ch, kz, sp, lens = raw_data["kspace_data_z"].shape
+                # t, ph, ch, kz, sp, lens = raw_data["kspace_data_z"].shape
                 # topk_ch = check_top_k_channel(raw_data["kspace_data_z"], k = self.top_k)
                 for k in self.keys:
-                    phase = raw_data[k]
-                    if phase.shape[2]==1:
-                        d = repeat(phase, 't ph () () sp len -> (t ch) ph () sp len', ch = ch)
-                    else:
-                        d = rearrange(phase, 't ph ch d sp len -> (t ch) ph d sp len')
+                    d = raw_data[k]
                     train_group.require_dataset(k, data=d.numpy(),shape = d.shape) if idx == 0 else train_group[k].append(d.numpy())
         if not iou.check_mk_dirs(self.cache_dir/"val.zarr"):
             val_group = zarr.group(store = zarr.DirectoryStore(self.cache_dir/"val.zarr"))
@@ -103,7 +99,7 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
                     if k == "cse":
                         d = rearrange(raw_data[k], 'ch d h w -> () ch d h w') 
                     else:
-                        d = rearrange(raw_data[k], 't ph ch d sp len  -> () t ch ph d sp len')
+                        d = rearrange(raw_data[k], 't ph ch d sp len  -> () t ph ch d sp len')
                     val_group.require_dataset(k, data=d.numpy(),shape = d.shape) if idx == 0 else val_group[k].append(d.numpy())
 
     def setup(self, init=False, stage: str = 'train'):
@@ -117,10 +113,10 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
                    "kspace_data_compensated", "kspace_data", "kspace_traj", "kspace_density_compensation",
                 ]),
                 # Lambdad(keys=["kspace_data_compensated", "kspace_data"], func = lambda x: torch.view_as_real(x).to(torch.float32)),
-                Lambdad(keys=["kspace_data_compensated", "kspace_data"], func = lambda x: rearrange(x, 'ph z sp len -> ph z (sp len)')),
+                Lambdad(keys=["kspace_data_compensated", "kspace_data"], func = lambda x: rearrange(x, 'ch ph z sp len -> ch ph z (sp len)')),
                 Lambdad(keys=["kspace_traj"], func = lambda x: torch.view_as_real(x).to(torch.float32)), 
-                Lambdad(keys=["kspace_traj"], func = lambda x: rearrange(x, 'ph () sp len c -> ph c (sp len)')),
-                Lambdad(keys=["kspace_density_compensation"], func = lambda x: rearrange(x, 'ph () sp len -> ph () (sp len)')),
+                Lambdad(keys=["kspace_traj"], func = lambda x: rearrange(x, 'ch ph () sp len c -> ch ph c (sp len)')),
+                Lambdad(keys=["kspace_density_compensation"], func = lambda x: rearrange(x, 'ch ph () sp len -> ch ph () (sp len)')),
             ])
             # buffered_dataset = ShuffleBuffer(data = Splitted_And_Packed_Dataset(**dict(zip(["kspace_data", "kspace_data_compensated", "kspace_traj", "kspace_density_compensation"], data))), buffer_size = 10)
             print("buffered dataset loading")
@@ -137,9 +133,9 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
                 # Lambdad(keys = ['kspace_data_compensated','kspace_data','kspace_traj', 'cse'],func = lambda x: np.array(x[0:2])),
                 ToTensord(device=torch.device('cpu'), keys=['kspace_data_compensated','kspace_data','kspace_traj', 'cse']),
                 # Lambdad(keys=["kspace_data_compensated", "kspace_data"], func = lambda x: rearrange(x, 't ch ph z sp len -> t ch ph z (sp len)')[...,35:45,:]),
-                Lambdad(keys=["kspace_data_compensated", "kspace_data"], func = lambda x: rearrange(x, 't ch ph z sp len -> t ch ph z (sp len)')),
+                Lambdad(keys=["kspace_data_compensated", "kspace_data"], func = lambda x: rearrange(x, 't ph ch z sp len -> t ph ch z (sp len)')),
                 Lambdad(keys=["kspace_traj"], func = lambda x: torch.view_as_real(x).to(torch.float32)), 
-                Lambdad(keys=["kspace_traj"], func = lambda x: rearrange(x, 't ch ph () sp len c -> t ch ph c (sp len)')),
+                Lambdad(keys=["kspace_traj"], func = lambda x: rearrange(x, 't ph ch () sp len c -> t ph ch c (sp len)')),
                 # Lambdad(keys=["cse"], func = lambda x: x[...,40:41,:,:]),
                 # Lambdad(keys=["cse"], func = lambda x: x.unsqueeze(0).expand(34,-1,-1,-1,-1)),
                 # Lambdad(keys=['kspace_data_compensated','kspace_data','kspace_traj', 'cse'], func=lambda x: x.unsqueeze(0)),
@@ -177,7 +173,7 @@ if __name__ == "__main__":
     # dataset = LibriSpeech()
     # dataset.prepare_data()
 
-    data = ONC_DCE_DeCoLearn()
+    data = DCE_P2PCSE_KXKY()
     data.prepare_data()
     data.setup()
     for i in data.train_dataloader():

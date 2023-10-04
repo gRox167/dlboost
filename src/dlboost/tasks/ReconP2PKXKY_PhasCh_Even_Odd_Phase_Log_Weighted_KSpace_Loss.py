@@ -61,13 +61,15 @@ class Recon(pl.LightningModule):
         kspace_traj_fixed, kspace_traj_moved = batch['kspace_traj'][:, 0::2, ...], batch['kspace_traj'][:, 1::2, ...]
         kspace_data_fixed, kspace_data_moved = batch['kspace_data'][:, 0::2, ...], batch['kspace_data'][:, 1::2, ...]
         kspace_data_compensated_fixed, kspace_data_compensated_moved = batch['kspace_data_compensated'][:, 0::2, ...], batch['kspace_data_compensated'][:, 1::2, ...]
+        # w_fixed, w_moved = batch["kspace_density_compensation"][:, 0::2, ...], batch["kspace_density_compensation"][:, 1::2, ...]
         weight = torch.arange(1, kspace_data_fixed.shape[-1]//2+1, device=kspace_data_fixed.device)
-        # weight = torch.ones(kspace_data_fixed.shape[-1]//2, device=kspace_data_fixed.device)
+        # weight = torch.cat([weight, ], dim=0)
         weight_reverse_sample_density = torch.cat([weight.flip(0),weight], dim=0)
+        weight_reverse_sample_density  = torch.log(weight_reverse_sample_density)+1
         image_init_fixed = nufft_adj_fn(
             kspace_data_compensated_fixed, kspace_traj_fixed, self.nufft_adj)
 
-        image_recon_fixed = self.recon_module(image_init_fixed)
+        image_recon_fixed = self.forward(image_init_fixed)
         loss_f2m = self.calculate_recon_loss(image_recon=image_recon_fixed,
                                     kspace_traj=kspace_traj_moved,
                                     kspace_data=kspace_data_moved,
@@ -77,7 +79,7 @@ class Recon(pl.LightningModule):
 
         image_init_moved = nufft_adj_fn(
             kspace_data_compensated_moved, kspace_traj_moved, self.nufft_adj)
-        image_recon_moved = self.recon_module(image_init_moved)
+        image_recon_moved = self.forward(image_init_moved)
         loss_m2f = self.calculate_recon_loss(image_recon=image_recon_moved,
                                 kspace_traj=kspace_traj_fixed,
                                 kspace_data=kspace_data_fixed,
@@ -104,9 +106,6 @@ class Recon(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         validation_step(self, batch, batch_idx)
-        
-    def predict_step(self, batch: Any, batch_idx: int = 0, dataloader_idx: int = 0, device = torch.device("cuda"), ch_reduce_fn = torch.sum) -> Any:
-        return predict_step(batch, self.nufft_adj, self, self.patch_size, device = device, ch_reduce_fn = ch_reduce_fn)
         
     def configure_optimizers(self):
         recon_optimizer = self.recon_optimizer(

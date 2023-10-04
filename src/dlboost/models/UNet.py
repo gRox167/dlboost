@@ -1,21 +1,11 @@
-# Copyright (c) MONAI Consortium
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#     http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from collections.abc import Sequence
 from re import split
+import re
 
 import torch.nn as nn
 import torch
-from torch import Tensor
-from einops import rearrange,repeat
+from torch import Tensor, vmap
+from einops import rearrange,repeat, reduce
 
 from monai.apps.reconstruction.networks.nets.utils import (
     complex_normalize,
@@ -25,6 +15,39 @@ from monai.apps.reconstruction.networks.nets.utils import (
     reshape_complex_to_channel_dim,
 )
 from monai.networks.nets.basic_unet import BasicUNet
+
+def percentile(t: torch.tensor, l, h):
+    """
+    Return the ``q``-th percentile of the flattened input tensor's data.
+    
+    CAUTION:
+     * Needs PyTorch >= 1.1.0, as ``torch.kthvalue()`` is used.
+     * Values are not interpolated, which corresponds to
+       ``numpy.percentile(..., interpolation="nearest")``.
+       
+    :param t: Input tensor.
+    :param q: Percentile to compute, which must be between 0 and 100 inclusive.
+    :return: Resulting value (scalar).
+    """
+    # Note that ``kthvalue()`` works one-based, i.e. the first sorted value
+    # indeed corresponds to k=1, not k=0! Use float(q) instead of q directly,
+    # so that ``round()`` returns an integer, even if q is a np.float32.
+    l_ = 1 + round(.01 * float(l) * (t.numel() - 1))
+    h_ = 1 + round(.01 * float(h) * (t.numel() - 1))
+    l_th = t.kthvalue(l_).values
+    h_th = t.kthvalue(h_).values
+    return l_th, h_th
+
+percentile_v = vmap(percentile, in_dims=(0, None, None), out_dims=0)
+clamp_v = vmap(torch.clamp, in_dims=(0, 0, 0), out_dims=0)
+def complex_normalize_abs_95(x: Tensor, start_dim = 1) -> tuple[Tensor, Tensor, Tensor]:
+    x_abs = x.abs()  
+    min_95, max_95 = percentile_v(x_abs.flatten(start_dim), 2.5, 97.5)
+    x_abs_clamped = clamp_v(x_abs, min_95, max_95)
+    # x_abs_clamped = x_abs.clamp(min=min_95, max=max_95)
+    mean = reduce(x_abs_clamped, "b c d h w -> b () () () ()", "mean")
+    std = reduce(x_abs_clamped, "b c d h w -> b () () () ()", lambda x,dim: torch.std(x, dim=dim, unbiased=False))
+    return (x - mean) / std, mean, std 
 
 
 class ComplexUnet(nn.Module):
@@ -76,22 +99,18 @@ class ComplexUnet(nn.Module):
             output of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
         """
         # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
+        x, mean, std = complex_normalize_abs_95(x)  # x will be of shape (B,C*2,H,W)
+
         x = torch.view_as_real(x)
+
         x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
-        x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
-        # pad input
-        # x, padding_sizes = divisible_pad_t(
-        #     x, k=self.pad_factor
-        # )  # x will be of shape (B,C*2,H',W') where H' and W' are for after padding
+        # x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
 
         x = self.unet(x)
-        # inverse padding
-        # x = inverse_divisible_pad_t(x, padding_sizes)  # x will be of shape (B,C*2,H,W)
-        std = repeat(std, "b c ... -> b (c r) ...", r= x.shape[1]//(self.in_channels*2))
-        mean = repeat(mean, "b c ... -> b (c r) ...", r= x.shape[1]//(self.in_channels*2))
-        x = x * std + mean
         x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
-        return torch.view_as_complex(x.contiguous())
+        x = torch.view_as_complex(x.contiguous())
+        x = x * std + mean
+        return x
     
 
 
