@@ -1,17 +1,28 @@
+from os import PathLike
+from pathlib import Path
+from typing import Any, Literal, Optional, Sequence
+import lightning.pytorch as pl
+import nibabel as nib
 import torch
-from mrboost import io_utils as iou
 from mrboost import reconstruction as recon
 from mrboost import computation as comp
+from mrboost.io_utils import to_nifty
+# from monai.data.image_reader import ImageReader
+import zarr
+from einops import rearrange#, reduce, repeat
+from torch.utils.data import Dataset
+import monai
+from lightning.pytorch.callbacks import BasePredictionWriter
 
 
 def recon_one_scan(dat_file_to_recon, phase_num=5, time_per_contrast=10):
     reconstructor = recon.CAPTURE_VarW_NQM_DCE_PostInj(
-        dat_file_location=dat_file_to_recon, phase_num=phase_num, which_slice=-1, which_contra=-1, which_phase=-1, time_per_contrast=time_per_contrast, device=torch.device('cuda:0'))
+        dat_file_location=dat_file_to_recon, phase_num=phase_num, which_slice=-1, which_contra=-1, which_phase=-1, time_per_contrast=time_per_contrast, device=torch.device('cuda:1'))
     raw_data = reconstructor.get_raw_data(reconstructor.dat_file_location)
     reconstructor.args_init()
 
     preprocessed_data = reconstructor.data_preprocess(raw_data)
-    kspace_data_centralized, kspace_data_mask, kspace_data_z, kspace_traj, kspace_density_compensation, cse =\
+    _, _, kspace_data_z, kspace_traj, kspace_density_compensation, cse =\
         preprocessed_data['kspace_data_centralized'], preprocessed_data['kspace_data_mask'], preprocessed_data['kspace_data_z'], \
         preprocessed_data['kspace_traj'], preprocessed_data['kspace_density_compensation'], preprocessed_data['cse'].coil_sens
     return_data = dict()
@@ -44,7 +55,7 @@ def check_top_k_channel(d, k=5):
         return sorted_idx[:k].tolist()
 
 
-class Splitted_And_Packed_Dataset(torch.utils.data.Dataset):
+class Splitted_And_Packed_Dataset(monai.data.Dataset):
     def __init__(self, **kwargs) -> None:
         self.data_dicts = kwargs
 
@@ -57,3 +68,81 @@ class Splitted_And_Packed_Dataset(torch.utils.data.Dataset):
     def __len__(self):
         k = list(self.data_dicts.keys())[0]
         return len(self.data_dicts[k])
+
+class DCE_P2PCSE_KXKY_Dataset(Dataset):
+    def __init__(self, data, transform=None, mode = "train") -> None:
+        super().__init__()
+        self.keys = ["kspace_data_z", "kspace_data_z_compensated",
+                     "kspace_traj", "kspace_density_compensation"]
+        self.data = data
+        self.mode = mode
+
+    def __len__(self) -> int:
+        if self.mode == "train":
+            return self.data["kspace_data_z"].shape[2]
+        else:
+            return len(self.data)
+
+    def __getitem__(self, index: int):
+        if self.mode == "train":
+            kspace_data_z = self.data["kspace_data_z"][:, :, index, ...]
+            kspace_data_z_compensated = self.data["kspace_data_z_compensated"][:,:,index,...]
+            kspace_traj = torch.from_numpy(self.data["kspace_traj"][:, :, 0])
+            kspace_data_z = rearrange(
+                torch.from_numpy(kspace_data_z), 'ph ch sp len -> ph ch (sp len)')
+            kspace_data_z_compensated = rearrange(
+                torch.from_numpy(kspace_data_z_compensated), 'ph ch sp len -> ph ch (sp len)')
+            # kspace_data_z_cse = rearrange(
+            #     torch.from_numpy(kspace_data_z_compensated[..., 240:400]), 'ph ch sp len -> ph ch (sp len)')
+            
+            # print(self.data["kspace_traj"].shape)
+            kspace_traj = torch.view_as_real(kspace_traj).to(torch.float32)
+            kspace_traj = rearrange(kspace_traj, 'ph () sp len c -> ph c (sp len)')
+            return dict(
+                kspace_data_z=kspace_data_z,
+                kspace_data_z_compensated=kspace_data_z_compensated,
+                # cse = self.data[index]["cse"],
+                # kspace_density_compensation = self.data["kspace_density_compensation"][:,:,0],
+                kspace_traj=kspace_traj)
+        else:
+            kspace_data_z = self.data[index]["kspace_data_z"][:]
+            kspace_data_z_compensated = self.data[index]["kspace_data_z_compensated"][:]
+            kspace_traj = torch.from_numpy(self.data[index]["kspace_traj"][:, :, 0]) # ph, ch=1, z=1, sp, len
+            kspace_data_z = rearrange(
+                torch.from_numpy(kspace_data_z), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_compensated = rearrange(
+                torch.from_numpy(kspace_data_z_compensated), 'ph ch z sp len -> ph ch z (sp len)')
+            # print(self.data["kspace_traj"].shape)
+            kspace_traj = torch.view_as_real(kspace_traj).to(torch.float32)
+            kspace_traj = rearrange(kspace_traj, 'ph () sp len c -> ph c (sp len)')
+            return dict(
+                kspace_data_z=kspace_data_z,
+                kspace_data_z_compensated=kspace_data_z_compensated,
+                # cse = self.data[index]["cse"],
+                # kspace_density_compensation = self.data["kspace_density_compensation"][:,:,0],
+                kspace_traj=kspace_traj)
+            
+
+    def __getitems__(self, indices):
+        return [self.__getitem__(index) for index in indices]
+    
+class DCE_P2PCSE_Writer(BasePredictionWriter):
+    def __init__(self, output_dir: PathLike, write_interval: Literal['batch', 'epoch', 'batch_and_epoch'] = "batch") -> None:
+        super().__init__(write_interval)
+        self.output_dir = Path(output_dir)
+        
+    def write_on_batch_end(self, trainer, pl_module, predictions, batch_indices, batch, batch_idx, dataloader_idx) -> None:
+        for d in predictions:
+            print(d["image_init"].shape)
+            print(d["image_recon"].shape)
+            pid, contrast = d["id"].split("_")
+            zarr.save(self.output_dir/"MCNUFFT"/f"{pid}"/f"{contrast}.zarr", d["image_init"].abs().numpy(force=True))
+            zarr.save(self.output_dir/"MOTIF-CORD"/f"{pid}"/f"{contrast}.zarr", d["image_recon"].abs().numpy(force=True))
+            # to_nifty(torch.swapdims(d["image_init"].abs(),0,-1), self.output_dir/f"{d['id']}_init.nii.gz")
+            # breakpoint()
+            # to_nifty(torch.swapdims(d["image_recon"].abs(),0,-1), self.output_dir/f"{d['id']}_recon.nii.gz")
+            # nib.save(d["image_init"].numpy(force=True), self.output_dir/f"{d['id']}_init.nii.gz")
+            # nib.save(d["image_recon"].numpy(force=True), self.output_dir/f"{d['id']}_recon.nii.gz")
+
+
+

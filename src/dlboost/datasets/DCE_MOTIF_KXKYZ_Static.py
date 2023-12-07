@@ -1,37 +1,136 @@
 # %%
-from collections.abc import Callable, Sequence
 import os
 from glob import glob
 from pathlib import Path
 
-import numpy as np
 import torch
 import zarr
-from einops import rearrange, reduce, repeat
-from monai.data import (IterableDataset, PatchDataset,
-                        PatchIterd, ShuffleBuffer)
-from monai.transforms import (AddChanneld, Compose, EnsureChannelFirstd,
-                              Lambda, Lambdad, MapTransform, RandGridPatchd,
-                              RandSpatialCropSamplesd, SplitDimd, ToTensord,
-                              Transform, apply_transform)
-from mrboost import computation as comp
+from einops import rearrange
 from mrboost import io_utils as iou
-from mrboost import reconstruction as recon
-from pytorch_lightning import (LightningDataModule, LightningModule, Trainer,
-                               seed_everything)
-from tqdm import tqdm
-from torch.utils.data import Subset, Dataset, DataLoader
-from typing import Sequence, Union
+from pytorch_lightning import (LightningDataModule)
+from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass
 
-from dlboost.datasets.boilerplate import *
+from dlboost.datasets.boilerplate import recon_one_scan
+
+@dataclass
+class MRReconInput:
+    data: torch.Tensor
+    image: torch.Tensor
+    csm: torch.Tensor
+    mvf: torch.Tensor
+    omega: torch.Tensor
+    w: torch.Tensor
+
+    def clone(self):
+        return MRReconInput(
+            data=self.data.clone(),
+            image=self.image.clone(),
+            csm=self.csm.clone(),
+            mvf=self.mvf.clone(),
+            omega=self.omega.clone(),
+            w=self.w.clone()
+        )
+        
+    def to(self, device):
+        return MRReconInput(
+            data=self.data.to(device),
+            image=self.image.to(device),
+            csm=self.csm.to(device),
+            mvf=self.mvf.to(device),
+            omega=self.omega.to(device),
+            w=self.w.to(device)
+        )
 
 # %%
+class DCE_MOTIF_KXKYZ_Dataset(Dataset):
+    def __init__(self, data, transform=None, mode = "train", patch_size_z = 5, filename=None) -> None:
+        super().__init__()
+        self.keys = ["kspace_data_z", "kspace_data_z_compensated",
+                     "kspace_traj", "kspace_density_compensation"]
+        self.data = data
+        self.mode = mode
+        self.patch_size_z = patch_size_z
+        self.id = Path(filename).stem
+
+    def __len__(self) -> int:
+        if self.mode == "train":
+            return self.data["kspace_data_z"].shape[2]//self.patch_size_z
+        else:
+            return len(self.data)
+
+    def __getitem__(self, index: int):
+        if self.mode == "train":
+            start_idx = index*self.patch_size_z
+            end_idx = (index+1)*self.patch_size_z
+            kspace_data_z_ = self.data["kspace_data_z"][:, :, start_idx: end_idx, ...]
+            kspace_data_z_compensated_ = self.data["kspace_data_z_compensated"][:,:, start_idx: end_idx,...]
+            kspace_data_z_fixed = rearrange(
+                torch.from_numpy(kspace_data_z_[0::2]), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_moved = rearrange(
+                torch.from_numpy(kspace_data_z_[1::2]), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_compensated_fixed = rearrange(
+                torch.from_numpy(kspace_data_z_compensated_[0::2]), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_compensated_moved = rearrange(
+                torch.from_numpy(kspace_data_z_compensated_[1::2]), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_cse_fixed = rearrange(
+                torch.tensor(kspace_data_z_[0::2,..., 240:400]), 'ph ch z sp len -> () ch z (ph sp len)')
+            kspace_data_z_cse_moved = rearrange(
+                torch.tensor(kspace_data_z_[1::2,..., 240:400]), 'ph ch z sp len -> () ch z (ph sp len)')
+            kspace_data_z_cse = torch.cat((kspace_data_z_cse_fixed, kspace_data_z_cse_moved), dim = 0)
+
+            kspace_traj_ = torch.from_numpy(self.data["kspace_traj"][:, :, 0])
+            kspace_traj_ = torch.view_as_real(kspace_traj_).to(torch.float32)
+            kspace_traj_fixed = rearrange(kspace_traj_[0::2], 'ph () sp len c -> ph c (sp len)')
+            kspace_traj_moved = rearrange(kspace_traj_[1::2], 'ph () sp len c -> ph c (sp len)')
+            
+            kspace_traj_cse_fixed = rearrange(kspace_traj_[0::2,:,:, 240:400], 'ph () sp len c -> () c (ph sp len)')
+            kspace_traj_cse_moved = rearrange(kspace_traj_[1::2,:,:, 240:400], 'ph () sp len c -> () c (ph sp len)')
+            # kspace_traj_cse = torch.cat((kspace_traj_cse_fixed, kspace_traj_cse_moved), dim = 0)
+
+            return dict(
+                kspace_data_z_fixed=kspace_data_z_fixed,
+                kspace_data_z_moved=kspace_data_z_moved,
+                kspace_data_z_compensated_fixed=kspace_data_z_compensated_fixed,
+                kspace_data_z_compensated_moved=kspace_data_z_compensated_moved,
+                kspace_traj_fixed=kspace_traj_fixed,
+                kspace_traj_moved=kspace_traj_moved,
+                kspace_data_z_cse_fixed = kspace_data_z_cse_fixed,
+                kspace_data_z_cse_moved = kspace_data_z_cse_moved,
+                kspace_traj_cse_fixed = kspace_traj_cse_fixed,
+                kspace_traj_cse_moved = kspace_traj_cse_moved,
+                )
+        else:
+            kspace_data_z_ = self.data[index]["kspace_data_z"][:]
+            kspace_data_z_compensated_ = self.data[index]["kspace_data_z_compensated"][:]
+            kspace_traj_ = torch.from_numpy(self.data[index]["kspace_traj"][:, :, 0]) # ph, ch=1, z=1, sp, len
+            kspace_data_z = rearrange(
+                torch.from_numpy(kspace_data_z_), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_compensated = rearrange(
+                torch.from_numpy(kspace_data_z_compensated_), 'ph ch z sp len -> ph ch z (sp len)')
+            kspace_data_z_cse = rearrange(
+                torch.tensor(kspace_data_z_[..., 240:400]), 'ph ch z sp len -> () ch z (ph sp len)')
+            kspace_traj_ = torch.view_as_real(kspace_traj_).to(torch.float32)
+            kspace_traj = rearrange(kspace_traj_, 'ph () sp len c -> ph c (sp len)')
+            
+            kspace_traj_cse = rearrange(kspace_traj_[:,:,:,240:400], 'ph () sp len c -> () c (ph sp len)')
+            return dict(
+                kspace_data_z=kspace_data_z,
+                kspace_data_z_compensated=kspace_data_z_compensated,
+                kspace_data_z_cse = kspace_data_z_cse,
+                kspace_traj_cse = kspace_traj_cse,
+                kspace_traj=kspace_traj,
+                id = self.id)
+            
+
+    def __getitems__(self, indices):
+        return [self.__getitem__(index) for index in indices]
 
 
 
 
 # %%
-class DCE_P2PCSE_KXKY(LightningDataModule):
+class DCE_MOTIF_KXKYZ(LightningDataModule):
     def __init__(
         self,
         data_dir: os.PathLike = '/data/anlab/Chunxu/RawData_MR/',
@@ -128,16 +227,16 @@ class DCE_P2PCSE_KXKY(LightningDataModule):
     def setup(self, init=False, stage: str = 'train'):
         if stage == 'train' or stage == 'continue':
             data_filenames = glob(str(self.cache_dir/"train/*.zarr"))
-            train_datasets = [DCE_P2PCSE_KXKY_Dataset(
-                zarr.open(filename, mode='r')) for filename in data_filenames]
+            train_datasets = [DCE_MOTIF_KXKYZ_Dataset(
+                zarr.open(filename, mode='r'), patch_size_z= self.patch_size[0], filenames=filename) for filename in data_filenames]
             self.train_dataset = torch.utils.data.ConcatDataset(train_datasets)
 
         data_filenames = glob(str(self.cache_dir/"val/ONC-DCE-004_0.zarr"))
         data  = [zarr.open(filename, mode='r') for filename in data_filenames]
-        self.val_dataset =DCE_P2PCSE_KXKY_Dataset(data, mode = "val")
+        self.val_dataset =DCE_MOTIF_KXKYZ_Dataset(data, mode = "val", filenames=data_filenames)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.train_batch_size, num_workers=16, collate_fn=lambda x: x)
+        return DataLoader(self.train_dataset, batch_size=self.train_batch_size, num_workers=16, collate_fn=lambda x: x, shuffle=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=2, num_workers=0, collate_fn=lambda x: x, shuffle=False)
@@ -153,7 +252,7 @@ if __name__ == "__main__":
     # dataset = LibriSpeech()
     # dataset.prepare_data()
 
-    data = DCE_P2PCSE_KXKY()
+    data = DCE_MOTIF_KXKYZ()
     data.prepare_data()
     data.setup()
     # for i in data.train_dataloader():

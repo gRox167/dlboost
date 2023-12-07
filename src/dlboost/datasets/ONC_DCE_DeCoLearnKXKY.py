@@ -10,13 +10,13 @@ from tqdm import tqdm
 from einops import rearrange, reduce, repeat
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer, seed_everything
 from monai.transforms import Lambda,SplitDimd,Lambdad, EnsureChannelFirstd, RandGridPatchd, RandSpatialCropSamplesd, Transform, MapTransform, Compose, ToTensord, AddChanneld
-from monai.data import PatchIterd, Dataset, PatchDataset, IterableDataset, ShuffleBuffer
 from monai.data import DataLoader
 
 from mrboost import io_utils as iou
 from mrboost import reconstruction as recon
 from mrboost import computation as comp
 from dlboost.datasets.boilerplate import *
+from monai.data import PatchIterd, Dataset, PatchDataset, IterableDataset, ShuffleBuffer
 
 
 class ONC_DCE_DeCoLearn(LightningDataModule):
@@ -32,6 +32,7 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
         train_batch_size: int = 4,
         eval_batch_size: int = 1,
         num_workers: int = 0,
+        val_contra = 0
         # cache_dir: os.PathLike = '/bmr207/nmrgrp/nmr201/.cache',
     ):
         super().__init__()
@@ -50,6 +51,7 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
         self.val_keys = ["kspace_data_z", "kspace_data_z_compensated", "kspace_traj", "cse"]
         self.raw_data_list = glob("ONC-DCE-*", root_dir = self.data_dir)
         self.top_k=5
+        self.val_contra = val_contra
 
         self.dat_file_path_list = [
             "CCIR_01168_ONC-DCE/ONC-DCE-003/meas_MID00781_FID11107_CAPTURE_FA15_Dyn.dat",
@@ -129,7 +131,7 @@ class ONC_DCE_DeCoLearn(LightningDataModule):
             self.train_dataset = PatchDataset(data = buffered_dataset, 
                                                   patch_func=sampler, samples_per_image=self.num_samples_per_subject, 
                                                   transform=train_transforms)
-        val_data = [zarr.open(self.cache_dir/"val.zarr", mode='r')[k][0:1, 0:1] for k in self.val_keys[0:3]]+[zarr.open(self.cache_dir/"val.zarr", mode='r')["cse"][0:1]]
+        val_data = [zarr.open(self.cache_dir/"val.zarr", mode='r')[k][0:1, self.val_contra:self.val_contra+1] for k in self.val_keys[0:3]]+[zarr.open(self.cache_dir/"val.zarr", mode='r')["cse"][0:1]]
         ########## WARNING Load all the 34 contrast will blow up the memory!!! ##########
         eval_transforms = Compose([
                 # EnsureChannelFirstd(keys=[

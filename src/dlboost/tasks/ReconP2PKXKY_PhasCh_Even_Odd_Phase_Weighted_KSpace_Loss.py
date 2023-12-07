@@ -23,6 +23,7 @@ from dlboost.models.SpatialTransformNetwork import SpatialTransformNetwork
 from dlboost import losses
 from dlboost.utils import complex_as_real_2ch, real_2ch_as_complex, complex_as_real_ch, to_png
 from dlboost.tasks.boilerplate import *
+from dlboost.tasks.boilerplate_P2PKXKY import *
 
 class Recon(pl.LightningModule):
     def __init__(

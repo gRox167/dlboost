@@ -1,17 +1,14 @@
-
+__all__ = ["DWUNet", "DWUNet_P2PCSE"]
 import torch
 from torch import nn
-from torch.nn import functional as F
-from typing import Sequence, Union, Tuple, Optional
-from monai.networks.blocks import UnetUpBlock, UnetResBlock, UnetBasicBlock
-from monai.networks.blocks import Convolution, UpSample
-from monai.networks.layers.factories import Conv, Pool
-from monai.networks.layers.utils import get_act_layer, get_dropout_layer, get_norm_layer
-from monai.utils import ensure_tuple_rep
+# from torch.nn import functional as F
+from typing import Sequence, Optional
+from monai.networks.layers.utils import get_act_layer, get_norm_layer
+# from monai.utils import ensure_tuple_rep
 from einops.layers.torch import Rearrange
 from math import prod
 
-from dlboost.models.BasicUNet import Down
+# from dlboost.models.BasicUNet import Down
 
 
 class DWInvertedBlock(nn.Module):
@@ -30,15 +27,19 @@ class DWInvertedBlock(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        if spatial_dims == 2:
+            conv = nn.Conv2d
+        elif spatial_dims == 3:
+            conv = nn.Conv3d
         if in_channels != out_channels:
-            self.shortcut_conv = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride, bias=True)
-        self.pwconv1 = nn.Conv3d(in_channels, int(mlp_ratio * out_channels), kernel_size=1, bias=True) # pointwise/1x1 convs, implemented with linear layers
+            self.shortcut_conv = conv(in_channels, out_channels, kernel_size=1, stride=stride, bias=True)
+        self.pwconv1 = conv(in_channels, int(mlp_ratio * out_channels), kernel_size=1, bias=True) # pointwise/1x1 convs, implemented with linear layers
         # self.norm1 = norm_layer(int(mlp_ratio * dim))
         self.norm1 = get_norm_layer(name=norm_name, spatial_dims=spatial_dims, channels = int(mlp_ratio * out_channels))
         self.act1 = get_act_layer(act_name)
-        self.conv_dw = nn.Conv3d(int(mlp_ratio * out_channels), int(mlp_ratio * out_channels), kernel_size=kernel_size, padding="same",
+        self.conv_dw = conv(int(mlp_ratio * out_channels), int(mlp_ratio * out_channels), kernel_size=kernel_size, padding="same",
                                  groups=int(mlp_ratio * out_channels), stride=stride, bias=True)  # depthwise conv
-        self.pwconv2 = nn.Conv3d(int(mlp_ratio * out_channels), out_channels, kernel_size=1, bias=True)
+        self.pwconv2 = conv(int(mlp_ratio * out_channels), out_channels, kernel_size=1, bias=True)
         # self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim)) if layer_scale_init_value > 0 else None
         # self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         # self.downsample = downsample
@@ -51,15 +52,8 @@ class DWInvertedBlock(nn.Module):
         x = self.act1(x)
         x = self.conv_dw(x)
         x = self.pwconv2(x)
-        # if self.gamma is not None:
-            # x = x.mul(self.gamma.reshape(1, -1, 1, 1))
-        # if self.downsample is not None:
-            # shortcut = self.downsample(shortcut)
-        # x = self.drop_path(x) + shortcut        
         if self.in_channels != self.out_channels:
             shortcut = self.shortcut_conv(shortcut)
-        # print(x.shape, shortcut.shape)
-        # breakpoint()
         x = x + shortcut
         return x
 
@@ -76,7 +70,11 @@ class DWInvertedDownStage(nn.Module):
                 blocks_num: int = 2):
         super().__init__()
         self.blocks = nn.ModuleList()
-        blocks = [nn.AvgPool3d(stride) ]
+        if spatial_dims == 2:
+            self.downsample = nn.AvgPool2d(stride)
+        elif spatial_dims == 3:
+            self.downsample = nn.AvgPool3d(stride)
+        blocks = [self.downsample ]
         blocks.append(DWInvertedBlock(spatial_dims, in_channels, out_channels, kernel_size, 1, norm_name, act_name, dropout))
         for _ in range(blocks_num-1):
             self.blocks.append(DWInvertedBlock(spatial_dims, out_channels, out_channels, kernel_size, 1, norm_name, act_name, dropout))
@@ -100,7 +98,12 @@ class DWInvertedUpStage(nn.Module):
                 dropout: tuple | str | float | None = None,
                 blocks_num: int = 2):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=upsample_factors, mode='trilinear', align_corners=True)
+        if spatial_dims == 2:
+            self.upsample = nn.Upsample(scale_factor=upsample_factors, mode='bilinear', align_corners=True)
+        elif spatial_dims == 3:
+            self.upsample = nn.Upsample(scale_factor=upsample_factors, mode='trilinear', align_corners=True)
+        else:
+            raise NotImplementedError("Only 2D and 3D are supported.")
         blocks = [DWInvertedBlock(spatial_dims, in_channels+cat_channels, out_channels, kernel_size, 1, norm_name, act_name, dropout)]
         for _ in range(blocks_num-1):
             blocks.append(DWInvertedBlock(spatial_dims, out_channels, out_channels, kernel_size, 1, norm_name, act_name, dropout))
@@ -200,7 +203,7 @@ class DWUNet(nn.Module):
         x4 = self.down_4(x3)
 
         u4 = self.upcat_4(x4, x3)
-        u3 = self.upcat_3(x3, x2)
+        u3 = self.upcat_3(u4, x2)
         u2 = self.upcat_2(u3, x1)
         u1 = self.upcat_1(u2, x0)
 

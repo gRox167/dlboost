@@ -1,0 +1,12 @@
+{
+    "exclude": [
+      "**/node_modules",
+      "**/__pycache__",
+      "**/experiments",
+      "**/tests",
+      "**/results",
+      "**/weights",
+      "**/wandb",
+      "**/ToolsForRecon"
+    ],
+  }

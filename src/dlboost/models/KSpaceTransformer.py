@@ -1,4 +1,4 @@
-from einops import reduce
+from einops import rearrange, reduce, repeat
 from torch import nn
 import torch
 import torch.nn.functional as F
@@ -7,7 +7,7 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer, TransformerDec
 
 class Transformer(nn.Module):
 
-    def __init__(self, lr_size, channel=2, d_model=512, nhead=8, num_encoder_layers=6,
+    def __init__(self, channel=2, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048,
                 #  HR_conv_channel=64, HR_conv_num=3, HR_kernel_size=5,
                  dropout=0.1, activation="gelu"):
@@ -21,7 +21,7 @@ class Transformer(nn.Module):
             nn.Linear(d_model, d_model)
         )
 
-        self.pe_layer = PositionalEncoding(d_model, position_dim_num=4,magnify=250.0)
+        self.pe_layer = PositionalEncoding(d_model, position_dim=4,magnify=250.0)
 
         encoder_layer = TransformerEncoderLayer(
             d_model, nhead, dim_feedforward, dropout, activation, batch_first=True)
@@ -29,8 +29,7 @@ class Transformer(nn.Module):
 
         decoder_layer = TransformerDecoderLayer(
             d_model, nhead, dim_feedforward, dropout, activation)
-        self.decoder = TransformerDecoder(d_model=d_model,
-                                              decoder_layer=decoder_layer,
+        self.decoder = TransformerDecoder(decoder_layer=decoder_layer,
                                               num_layers=num_decoder_layers)
 
         self.head = nn.Sequential(
@@ -90,3 +89,40 @@ class PositionalEncoding(nn.Module):
             positional_embeddings.append(positional_embedding)
         positional_embedding = torch.cat(positional_embeddings, dim=-1)
         return positional_embedding
+
+
+if __name__ == "__main__":
+    # test transformer
+    bs = 1
+    src_len = 9600
+    out_len = 9600
+    c = 2
+    d_model = 64
+    nhead = 8
+    num_encoder_layers = 6
+    num_decoder_layers = 6
+    dim_feedforward = 256
+    dropout = 0.1
+    activation = "gelu"
+
+    src = torch.randn(bs, src_len, c)
+    src_pos = torch.randn(bs, src_len, 2)
+    out_pos = torch.randn(bs, out_len, 2)
+
+    transformer = Transformer(d_model=d_model, nhead=nhead, num_encoder_layers=num_encoder_layers,
+                              num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward,
+                              dropout=dropout, activation=activation)
+    out = transformer(src, src_pos, out_pos)
+    print(out.shape)
+    print(out)
+    # test positional encoding
+    # bs = 2
+    # token_num = 100
+    # position_axis_num = 4
+    # dim = 128
+    # temperature = 10000
+    # position_encoding = PositionalEncoding(dim, temperature, position_axis_num)
+    # position_norm = torch.randn(bs, token_num, position_axis_num)
+    # pe = position_encoding(position_norm)
+    # print(pe.shape)
+    # print(pe)

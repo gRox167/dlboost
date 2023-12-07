@@ -1,5 +1,8 @@
 import torch 
 import einops as eo
+from functools import partial
+from typing import Sequence
+from torch.nn import functional as f
 
 def complex_as_real_2ch(x):
     # breakpoint()
@@ -47,3 +50,38 @@ def normalize(x, return_mean_std=False):
 
 def renormalize(x, mean, std):
     return x*std+mean
+
+def formap(func, in_dims = 0, out_dims = 0, batch_size = 1):
+    def func_return(*args, **kwargs):
+        if isinstance(in_dims, int):
+            _in_dims = [in_dims] * len(args)
+        elif isinstance(in_dims, Sequence):
+            assert len(in_dims) == len(args)
+            _in_dims = in_dims
+        b = args[0].shape[_in_dims[0]]
+        # for i, arg in enumerate(args):
+        #     print(i, arg.shape)
+        _args = [ [arg]*b if i is None else torch.chunk(arg, dim = i, chunks = batch_size) for i, arg in zip(_in_dims, args) ]
+        # for i, arg in enumerate(_args):
+        #     print(i, len(arg))
+        #     print(arg[0].shape)
+        # _kwargs = {k: [v]*b for k, v in kwargs.items()}
+        func_partial = partial(func, **kwargs)
+        # _out = list(zip(*map(func_partial, *_args)))
+        if isinstance(out_dims, int):
+            _out = list(map(func_partial, *_args))
+            _out = torch.cat(_out, dim = out_dims)
+        elif isinstance(out_dims, Sequence):
+            _out_dims = out_dims
+            _out = list(zip(*map(func_partial, *_args)))
+            _out = [torch.cat(out, dim = i) if i is not None else out for i, out in zip(_out_dims, _out)]
+        return _out if len(_out) > 1 else _out[0]
+    return func_return
+
+def interpolate(img, scale_factor, mode, align_corners = True):
+    if not torch.is_complex(img):
+        return f.interpolate(img, scale_factor=scale_factor, mode=mode, align_corners=True)
+    else:
+        r = f.interpolate(img.real, scale_factor=scale_factor, mode=mode, align_corners=True)
+        i = f.interpolate(img.imag, scale_factor=scale_factor, mode=mode, align_corners=True)
+        return torch.complex(r,i)

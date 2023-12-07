@@ -118,7 +118,7 @@ class VoxelMorph(nn.Module):
         self.flow.weight = nn.Parameter(nd.sample(self.flow.weight.shape), requires_grad=True)
         self.flow.bias = nn.Parameter(torch.zeros(self.flow.bias.shape), requires_grad=True)
 
-        self.spatial_transform = SpatialTransformNetwork(vol_size, dims=dim)
+        self.spatial_transform = SpatialTransformNetwork(vol_size)#, dims=dim)
 
     def forward(self, src, tgt, to_warp=None):
         """ # TODO: t is not used
