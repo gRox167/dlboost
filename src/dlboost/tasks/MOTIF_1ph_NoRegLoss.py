@@ -5,7 +5,7 @@ import torchopt
 from dlboost.models import SpatialTransformNetwork
 from dlboost.tasks.boilerplate_MOTIF import MOTIF
 from dlboost.utils.tensor_utils import interpolate
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import nn, optim
 from torch.nn import functional as f
 from torchopt import pytree
