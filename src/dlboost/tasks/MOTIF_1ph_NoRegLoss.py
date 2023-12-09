@@ -6,7 +6,7 @@ from dlboost.models import SpatialTransformNetwork
 from dlboost.tasks.boilerplate_MOTIF import MOTIF
 from dlboost.utils.tensor_utils import interpolate
 from einops import rearrange
-from torch import nn, optim
+from torch import R, nn, optim
 from torch.nn import functional as f
 from torchopt import pytree
 
@@ -86,20 +86,15 @@ class CSE_DynPh(nn.Module):
         self.cse_module = cse_module
         self.nufft_im_size = nufft_im_size
         self.nufft_adj = tkbn.KbNufftAdjoint(im_size=self.nufft_im_size)
-    
 
     def kernel_regularize(self, csm_kernel):
-        ph,ch,d,h,w = csm_kernel.shape
+        ph, ch, d, h, w = csm_kernel.shape
         if ch < self.ch_pad:
-            _csm = f.pad(
-                csm_kernel, (0, 0, 0, 0, 0, 0, 0, self.ch_pad - ch)
-            )
+            _csm = f.pad(csm_kernel, (0, 0, 0, 0, 0, 0, 0, self.ch_pad - ch))
         else:
             raise ValueError("ch_pad should be larger or equal to coil channel number")
         _csm = self.cse_module(_csm)[:, :ch]
-        _csm = _csm / torch.sqrt(
-            torch.sum(torch.abs(_csm) ** 2, dim=1, keepdim=True)
-        )
+        _csm = _csm / torch.sqrt(torch.sum(torch.abs(_csm) ** 2, dim=1, keepdim=True))
         return _csm
 
     def forward(self, image, csm_kernel):
@@ -113,7 +108,7 @@ class CSE_DynPh(nn.Module):
 
 
 class MVF_Dyn(nn.Module):
-    def __init__(self, size, regis_module,ph_num=5):
+    def __init__(self, size, regis_module, ph_num=5):
         super().__init__()
         self.regis_module = regis_module
         self.spatial_transform = SpatialTransformNetwork(size=size, mode="bilinear")
@@ -123,8 +118,7 @@ class MVF_Dyn(nn.Module):
         self.upsample = lambda x: interpolate(
             x, scale_factor=(1, 2, 2), mode="trilinear"
         )
-        
-    
+
     def kernel_regularize(self, mvf_kernels):
         _mvf_kernels = [self.regularize_module(mvf) for mvf in mvf_kernels]
         return _mvf
@@ -196,15 +190,19 @@ class MR_Forward_Model_Static(nn.Module):
         return kspace_data_estimated, image_ph
 
 
-class MOTIF_Regularization(nn.Module):
-    def __init__(self, denoise_module, mvf_module, csm_module):
+class Denoise_Regularization(nn.Module):
+    def __init__(self, image_module, mvf_module, csm_module):
         super().__init__()
-        self.denoise_module = denoise_module
-        self.mvf_module = mvf_module
-        self.csm_module = csm_module
+        self.denoise_modules = {
+            "image": image_module,
+            "cse": csm_module,
+            "mvf": mvf_module,
+        }
 
-    def forward(self, x):
-        return self.recon_module.predict_step(x.image[None, None, ...]).squeeze((0, 1))
+    def forward(self, params):
+        return pytree.tree_map(
+            lambda x, module: module(x), params, self.denoise_modules
+        )
 
 
 class MOTIF_Unrolling(nn.Module):
@@ -234,9 +232,11 @@ class MOTIF_Unrolling(nn.Module):
         # initialization
         image_multi_ch = self.nufft_adj_forward(kspace_data, kspace_traj)
         image_init = self.image_init(image_multi_ch)
-        params = {"image": image_init, 
-                  "csm": self.cse_kernel_init(image_multi_ch), 
-                  "mvf": self.mvf_kernel_init(image_init)}
+        params = {
+            "image": image_init,
+            "csm": self.cse_kernel_init(image_multi_ch),
+            "mvf": self.mvf_kernel_init(image_init),
+        }
 
         for t in range(self.iterations):
             # apply forward model to get kspace_data_estimated
@@ -257,9 +257,11 @@ class MOTIF_Unrolling(nn.Module):
             reg_grads,
         )
         return updates
-    
+
     def image_init(self, image_multi_ch):
-        image_init = torch.sum(image_multi_ch * image_multi_ch.conj(), dim=1, keepdim=True)
+        image_init = torch.sum(
+            image_multi_ch * image_multi_ch.conj(), dim=1, keepdim=True
+        )
         return image_init
 
     def cse_kernel_init(self, image_multi_ch):
@@ -271,7 +273,10 @@ class MOTIF_Unrolling(nn.Module):
     def mvf_kernel_init(self, image):
         for i in range(2):
             _image = self.downsample(image)
-        mvf_kernels= [torch.zeros_like(_image).expand(-1, 3, -1, -1, -1) for i in range(self.ph_num-1)]
+        mvf_kernels = [
+            torch.zeros_like(_image).expand(-1, 3, -1, -1, -1)
+            for i in range(self.ph_num - 1)
+        ]
         return mvf_kernels
 
     # def nufft_forward(self, image_init, kspace_traj):
@@ -285,6 +290,8 @@ class MOTIF_Unrolling(nn.Module):
         b, ph, ch, d, length = kspace_data.shape
         # breakpoint()
         image = self.nufft_adj(
-            rearrange(kspace_data, 'b ph ch d len -> b (ch d) (ph len)'),
-            rearrange(kspace_traj, 'b ph comp len -> b comp (ph len)'), norm='ortho')
-        return rearrange(image, 'b (ch d) h w -> b ch d h w', ch=ch)
+            rearrange(kspace_data, "b ph ch d len -> b (ch d) (ph len)"),
+            rearrange(kspace_traj, "b ph comp len -> b comp (ph len)"),
+            norm="ortho",
+        )
+        return rearrange(image, "b (ch d) h w -> b ch d h w", ch=ch)
