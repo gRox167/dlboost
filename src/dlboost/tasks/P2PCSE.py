@@ -1,38 +1,19 @@
-from typing import Any, Sequence
-
+from typing import Any
+from pathlib import Path
+import dask.array as da
 import lightning as L
 import torch
 import torchkbnufft as tkbn
+import xarray as xr
 import zarr
-from dlboost.utils import formap, to_png
-from dlboost.utils.tensor_utils import interpolate
+from dlboost.models import ComplexUnet, DWUNet
+from dlboost.utils import to_png
+from dlboost.utils.tensor_utils import for_vmap, interpolate
 from einops import rearrange  # , reduce, repeat
 from monai.inferers import PatchInferer, SlidingWindowSplitter
-from torch import nn, optim
+from torch import optim
 from torch.nn import functional as f
-from dlboost.models import ComplexUnet, DWUNet
-
-# def cse_forward(image_init_ch, downsample, upsample, ch_pad, cse_module):
-#     ph,ch = image_init_ch.shape[0:2]
-#     image_init_ch_lr = image_init_ch.clone()
-#     for i in range(3):
-#         image_init_ch_lr = downsample(image_init_ch_lr)
-#     # image_init_ch_lr = interpolate(image_init_ch, scale_factor=0.25, mode='bilinear')
-#     if ch < ch_pad:
-#         image_init_ch_lr = f.pad(image_init_ch_lr, (0,0,0,0,0,ch_pad-ch))
-#     # print(image_init_ch_lr.shape)
-#     csm_lr = cse_module(
-#         rearrange(image_init_ch_lr, 'ph ch h w -> () (ph ch) h w'))
-#     csm_lr = rearrange(csm_lr, '() (ph ch) h w -> ph ch h w', ph=ph)[:, :ch]
-#     csm_hr = csm_lr
-#     for i in range(3):
-#         csm_hr = upsample(csm_hr)
-#     # csm_hr = self.upsample(csm_lr)
-#     # csm_hr = interpolate(csm_lr, scale_factor=4, mode='bilinear')
-#     # devide csm by its root square of sum
-#     csm_hr_norm = csm_hr / \
-#         torch.sqrt(torch.sum(torch.abs(csm_hr)**2, dim=1, keepdim=True))
-#     return csm_hr_norm
+from dlboost.utils.io_utils import multi_processing_save_data
 
 
 def postprocessing(x):
@@ -41,50 +22,21 @@ def postprocessing(x):
 
 
 def nufft_adj_gpu(
-    kspace_data, csm, kspace_traj, nufft_adj, inference_device, storage_device
+    kspace_data,
+    kspace_traj,
+    nufft_adj,
+    csm=None,
+    inference_device=torch.device("cuda"),
+    storage_device=torch.device("cpu"),
 ):
     image_init = nufft_adj(
         kspace_data.to(inference_device), kspace_traj.to(inference_device)
     )
-    result_reduced = torch.sum(image_init * csm.conj().to(inference_device), dim=1)
-    return result_reduced.to(storage_device)
-
-
-def forward_contrast(
-    kspace_data,
-    kspace_traj,
-    kspace_data_cse,
-    kspace_traj_cse,
-    recon_module,
-    cse_forward,
-    nufft_adj,
-    inference_device,
-    storage_device,
-    inferer=None,
-):
-    """
-    kspace_data: [ph, ch, z, len]
-    kspace_traj: [ph, 2, len]
-    """
-    with torch.no_grad():
-        csm = nufft_adj(
-            kspace_data_cse.to(inference_device), kspace_traj_cse.to(inference_device)
-        )
-        # input of cse_forward shape is [ph, ch, d, h, w]
-        csm = cse_forward(csm).to(storage_device)
-        image_init = formap(nufft_adj_gpu, 2, 1, 10)(
-            kspace_data,
-            csm,
-            kspace_traj=kspace_traj,
-            nufft_adj=nufft_adj,
-            inference_device=inference_device,
-            storage_device=storage_device,
-        )
-        if inferer is None:
-            image_recon = recon_module(image_init.unsqueeze(0)).squeeze(0)
-        else:
-            image_recon = inferer(image_init.unsqueeze(0), recon_module).squeeze(0)
-    return image_recon, image_init, csm
+    if csm is not None:
+        result_reduced = torch.sum(image_init * csm.conj().to(inference_device), dim=1)
+        return result_reduced.to(storage_device)
+    else:
+        return image_init.to(storage_device)
 
 
 def gradient_loss(s, penalty="l2", reduction="mean"):
@@ -106,7 +58,7 @@ def gradient_loss(s, penalty="l2", reduction="mean"):
     return d / 2.0
 
 
-class P2PCSE_KXKYZ(L.LightningModule):
+class Recon(L.LightningModule):
     def __init__(
         self,
         nufft_im_size=(320, 320),
@@ -174,64 +126,64 @@ class P2PCSE_KXKYZ(L.LightningModule):
         recon_opt.zero_grad()
         batch = batch[0]
         # kspace data is in the shape of [ch, ph, sp]
-        kspace_traj_fixed, kspace_traj_moved = (
-            batch["kspace_traj_fixed"],
-            batch["kspace_traj_moved"],
+        kspace_traj_odd, kspace_traj_even = (
+            batch["kspace_traj_odd"],
+            batch["kspace_traj_even"],
         )
-        kspace_traj_cse_fixed, kspace_traj_cse_moved = (
-            batch["kspace_traj_cse_fixed"],
-            batch["kspace_traj_cse_moved"],
+        kspace_traj_cse_odd, kspace_traj_cse_even = (
+            batch["kspace_traj_cse_odd"],
+            batch["kspace_traj_cse_even"],
         )
-        kspace_data_fixed, kspace_data_moved = (
-            batch["kspace_data_z_fixed"],
-            batch["kspace_data_z_moved"],
+        kspace_data_odd, kspace_data_even = (
+            batch["kspace_data_odd"],
+            batch["kspace_data_even"],
         )
-        kspace_data_compensated_fixed, kspace_data_compensated_moved = (
-            batch["kspace_data_z_compensated_fixed"],
-            batch["kspace_data_z_compensated_moved"],
+        kspace_data_compensated_odd, kspace_data_compensated_even = (
+            batch["kspace_data_compensated_odd"],
+            batch["kspace_data_compensated_even"],
         )
-        kspace_data_cse_fixed, kspace_data_cse_moved = (
-            batch["kspace_data_z_cse_fixed"],
-            batch["kspace_data_z_cse_moved"],
+        kspace_data_cse_odd, kspace_data_cse_even = (
+            batch["kspace_data_cse_odd"],
+            batch["kspace_data_cse_even"],
         )
-
         # # kspace weighted loss
-        weight = torch.arange(
-            1, kspace_data_fixed.shape[-1] // 2 + 1, device=kspace_data_fixed.device
+        sp, len = 15, 640
+        weight = torch.arange(1, len // 2 + 1, device=kspace_data_odd.device)
+        weight_reverse_sample_density = torch.cat(
+            [weight.flip(0), weight], dim=0
+        ).expand(sp, len)
+        weight_reverse_sample_density = rearrange(
+            weight_reverse_sample_density, "sp len -> (sp len)"
         )
-        weight_reverse_sample_density = torch.cat([weight.flip(0), weight], dim=0)
 
-        image_init_fixed_ch = self.nufft_adj_forward(
-            kspace_data_cse_fixed, kspace_traj_cse_fixed
+        image_init_odd_ch = self.nufft_adj_forward(
+            kspace_data_cse_odd.unsqueeze(0), kspace_traj_cse_odd.unsqueeze(0)
         )
-        # image_init_fixed_ch = self.nufft_adj_forward(
-        #     kspace_data_fixed, kspace_traj_fixed)
         # shape is [1, ch, d, h, w]
 
-        csm_fixed = self.cse_forward(image_init_fixed_ch).expand(5, -1, -1, -1, -1)
-        # csm_fixed = self.cse_forward(image_init_fixed_ch)
+        csm_odd = self.cse_forward(image_init_odd_ch).expand(5, -1, -1, -1, -1)
         # csm_smooth_loss = self.smooth_loss_coef * self.smooth_loss_fn(csm_fixed)
         # self.log_dict({"recon/csm_smooth_loss": csm_smooth_loss})
 
-        image_init_fixed = self.nufft_adj_forward(
-            kspace_data_compensated_fixed, kspace_traj_fixed
+        image_init_odd = self.nufft_adj_forward(
+            kspace_data_compensated_odd, kspace_traj_odd
         )
-        image_init_fixed = torch.sum(image_init_fixed * csm_fixed.conj(), dim=1)
+        image_init_odd = torch.sum(image_init_odd * csm_odd.conj(), dim=1)
         # shape is [ph, d, h, w]
-        image_recon_fixed = self.recon_module(image_init_fixed.unsqueeze(0)).squeeze(0)
-        loss_f2m = self.calculate_recon_loss(
-            image_recon=image_recon_fixed.unsqueeze(1).expand_as(csm_fixed),
-            csm=csm_fixed,
-            kspace_traj=kspace_traj_moved,
-            kspace_data=kspace_data_moved,
+        image_recon_odd = self.recon_module(image_init_odd.unsqueeze(0)).squeeze(0)
+        loss_o2e = self.calculate_recon_loss(
+            image_recon=image_recon_odd.unsqueeze(1).expand_as(csm_odd),
+            csm=csm_odd,
+            kspace_traj=kspace_traj_even,
+            kspace_data=kspace_data_even,
             weight=weight_reverse_sample_density,
         )
-        self.manual_backward(loss_f2m, retain_graph=True)
+        self.manual_backward(loss_o2e, retain_graph=True)
         # self.manual_backward(loss_f2m+csm_smooth_loss, retain_graph=True)
-        self.log_dict({"recon/recon_loss": loss_f2m})
+        self.log_dict({"recon/recon_loss": loss_o2e})
 
-        image_init_moved_ch = self.nufft_adj_forward(
-            kspace_data_cse_moved, kspace_traj_cse_moved
+        image_init_even_ch = self.nufft_adj_forward(
+            kspace_data_cse_even.unsqueeze(0), kspace_traj_cse_even.unsqueeze(0)
         )
         # if self.global_step % 4 == 0:
         #     for ch in [0, 3, 5]:
@@ -240,46 +192,46 @@ class P2PCSE_KXKYZ(L.LightningModule):
         # image_init_moved_ch = self.nufft_adj_forward(
         #     kspace_data_moved, kspace_traj_moved)
         # shape is [ph, ch, h, w]
-        csm_moved = self.cse_forward(image_init_moved_ch).expand(5, -1, -1, -1, -1)
+        csm_even = self.cse_forward(image_init_even_ch).expand(5, -1, -1, -1, -1)
         # csm_moved = self.cse_forward(image_init_moved_ch)
         # csm_smooth_loss = self.smooth_loss_coef * self.smooth_loss_fn(csm_moved)
 
-        image_init_moved = self.nufft_adj_forward(
-            kspace_data_compensated_moved, kspace_traj_moved
+        image_init_even = self.nufft_adj_forward(
+            kspace_data_compensated_even, kspace_traj_even
         )
-        image_init_moved = torch.sum(image_init_moved * csm_moved.conj(), dim=1)
+        image_init_even = torch.sum(image_init_even * csm_even.conj(), dim=1)
         # shape is [ph, h, w]
-        image_recon_moved = self.recon_module(image_init_moved.unsqueeze(0)).squeeze(
+        image_recon_even = self.recon_module(image_init_even.unsqueeze(0)).squeeze(
             0
         )  # shape is [ph, h, w]
-        loss_m2f = self.calculate_recon_loss(
-            image_recon=image_recon_moved.unsqueeze(1).expand_as(csm_moved),
-            csm=csm_moved,
-            kspace_traj=kspace_traj_fixed,
-            kspace_data=kspace_data_fixed,
+        loss_e2o = self.calculate_recon_loss(
+            image_recon=image_recon_even.unsqueeze(1).expand_as(csm_even),
+            csm=csm_even,
+            kspace_traj=kspace_traj_odd,
+            kspace_data=kspace_data_odd,
             weight=weight_reverse_sample_density,
         )
-        self.manual_backward(loss_m2f, retain_graph=True)
+        self.manual_backward(loss_e2o, retain_graph=True)
         # self.manual_backward(loss_m2f + csm_smooth_loss, retain_graph=True)
 
         if self.global_step % 4 == 0:
             for ch in [0, 3, 5]:
                 to_png(
                     self.trainer.default_root_dir + f"/image_init_moved_ch{ch}.png",
-                    image_init_moved_ch[0, ch, 0, :, :],
+                    image_init_even_ch[0, ch, 0, :, :],
                 )  # , vmin=0, vmax=2)
                 to_png(
                     self.trainer.default_root_dir + f"/csm_moved_ch{ch}.png",
-                    csm_moved[0, ch, 0, :, :],
+                    csm_even[0, ch, 0, :, :],
                 )  # , vmin=0, vmax=2)
-            for i in range(image_init_moved.shape[0]):
+            for i in range(image_init_even.shape[0]):
                 to_png(
                     self.trainer.default_root_dir + f"/image_init_ph{i}.png",
-                    image_init_moved[i, 0, :, :],
+                    image_init_even[i, 0, :, :],
                 )  # , vmin=0, vmax=2)
                 to_png(
                     self.trainer.default_root_dir + f"/image_recon_ph{i}.png",
-                    image_recon_moved[i, 0, :, :],
+                    image_recon_even[i, 0, :, :],
                 )  # , vmin=0, vmax=2)
         recon_opt.step()
 
@@ -288,19 +240,14 @@ class P2PCSE_KXKYZ(L.LightningModule):
         image_init_ch_lr = image_init_ch.clone()
         for i in range(3):
             image_init_ch_lr = self.downsample(image_init_ch_lr)
-        # image_init_ch_lr = interpolate(image_init_ch, scale_factor=0.25, mode='bilinear')
         if ch < self.ch_pad:
             image_init_ch_lr = f.pad(
                 image_init_ch_lr, (0, 0, 0, 0, 0, 0, 0, self.ch_pad - ch)
             )
-        # print(image_init_ch_lr.shape)
         csm_lr = self.cse_module(image_init_ch_lr)
         csm_hr = csm_lr[:, :ch]
         for i in range(3):
             csm_hr = self.upsample(csm_hr)
-        # csm_hr = self.upsample(csm_lr)
-        # csm_hr = interpolate(csm_lr, scale_factor=4, mode='bilinear')
-        # devide csm by its root square of sum
         csm_hr_norm = csm_hr / torch.sqrt(
             torch.sum(torch.abs(csm_hr) ** 2, dim=1, keepdim=True)
         )
@@ -317,7 +264,6 @@ class P2PCSE_KXKYZ(L.LightningModule):
 
     def nufft_adj_forward(self, kspace_data, kspace_traj):
         ph, ch, d, length = kspace_data.shape
-        # breakpoint()
         image = self.nufft_adj(
             rearrange(kspace_data, "ph ch d len -> ph (ch d) len"),
             kspace_traj,
@@ -343,42 +289,33 @@ class P2PCSE_KXKYZ(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        for b in batch:
-            image_recon, image_init, csm = forward_contrast(
-                b["kspace_data_z_compensated"],
-                b["kspace_traj"],
-                b["kspace_data_z_cse"],
-                b["kspace_traj_cse"],
-                # b["kspace_data_z"], b["kspace_traj"],
-                recon_module=self.recon_module,
-                cse_forward=self.cse_forward,
-                nufft_adj=self.nufft_adj_forward,
-                inference_device=self.device,
+        b = batch[0]
+
+        def plot_and_validation(
+            kspace_data, kspace_traj, kspace_data_cse, kspace_traj_cse
+        ):
+            image_recon, image_init, csm = self.forward_contrast(
+                kspace_data,
+                kspace_traj,
+                kspace_data_cse.unsqueeze(0),
+                kspace_traj_cse,
                 storage_device=torch.device("cpu"),
-                inferer=self.inferer,
             )
-            print(image_recon.shape, image_init.shape, csm.shape)
             zarr.save(
                 self.trainer.default_root_dir
-                +
-                #   f'/epoch_{self.trainer.current_epoch}'+f'/image_init.zarr', image_init.abs().numpy(force=True))
-                f"/epoch_{self.trainer.current_epoch}"
+                + f"/epoch_{self.trainer.current_epoch}"
                 + "/image_init.zarr",
                 image_init[:, 35:45].abs().numpy(force=True),
             )
             zarr.save(
                 self.trainer.default_root_dir
-                +
-                #   f'/epoch_{self.trainer.current_epoch}'+f'/image_recon.zarr', image_recon.abs().numpy(force=True))
-                f"/epoch_{self.trainer.current_epoch}"
+                + f"/epoch_{self.trainer.current_epoch}"
                 + "/image_recon.zarr",
                 image_recon[:, 35:45].abs().numpy(force=True),
             )
             zarr.save(
                 self.trainer.default_root_dir
-                +
-                #   f'/epoch_{self.trainer.current_epoch}'+f'/csm.zarr', csm.abs().numpy(force=True))
-                f"/epoch_{self.trainer.current_epoch}"
+                + f"/epoch_{self.trainer.current_epoch}"
                 + "/csm.zarr",
                 csm[:, :, 35:45].abs().numpy(force=True),
             )
@@ -388,8 +325,6 @@ class P2PCSE_KXKYZ(L.LightningModule):
                 + f"/epoch_{self.trainer.current_epoch}"
             )
             for ch in [0, 3, 5]:
-                # to_png(self.trainer.default_root_dir+f'/epoch_{self.trainer.current_epoch}_'+f'/image_init_moved_ch{ch}.png',
-                #        image_init_ch[0, ch, :, :])  # , vmin=0, vmax=2)
                 to_png(
                     self.trainer.default_root_dir
                     + f"/epoch_{self.trainer.current_epoch}"
@@ -409,40 +344,171 @@ class P2PCSE_KXKYZ(L.LightningModule):
                     + f"/image_recon_ph{i}.png",
                     image_recon[i, 40, :, :],
                 )  # , vmin=0, vmax=2)
+            return image_recon
+
+        return for_vmap(plot_and_validation, (0, 0, 0, 0), None, None)(
+            b["kspace_data_compensated"],
+            b["kspace_traj"],
+            b["kspace_data_cse"],
+            b["kspace_traj_cse"],
+        )
 
     def predict_step(
         self,
         batch: Any,
-        batch_idx: int = 0,
+        batch_idx: int,
         dataloader_idx: int = 0,
-        device=torch.device("cuda"),
-        ch_reduce_fn=torch.sum,
     ) -> Any:
-        results = []
-        for b in batch:
-            # print(b["kspace_data_z"].shape, b["kspace_traj"].shape)
-            image_recon, image_init, csm = forward_contrast(
-                b["kspace_data_z_compensated"],
-                b["kspace_traj"],
-                b["kspace_data_z_cse"],
-                b["kspace_traj_cse"],
-                recon_module=self.recon_module,
-                cse_forward=self.cse_forward,
-                nufft_adj=self.nufft_adj_forward,
-                inference_device=self.device,
+        xarray_ds = batch[0]
+        print(xarray_ds.attrs["id"])
+
+        def _predict(kspace_data, kspace_traj, kspace_data_cse, kspace_traj_cse):
+            image_recon, image_init, csm = self.forward_contrast(
+                kspace_data,
+                kspace_traj,
+                kspace_data_cse.unsqueeze(0),
+                kspace_traj_cse,
                 storage_device=torch.device("cpu"),
-                inferer=self.inferer,
             )
-            # print(image_recon.shape, image_init.shape, csm.shape)
-            results.append(
+            # xarray_ds["P2PCSE_odd"][]
+            return image_recon
+
+        def _save(data, key):
+            xarray_ds[key] = xr.Variable(
+                ["t", "ph", "z", "h", "w"], data.numpy(force=True)
+            ).chunk(
                 {
-                    "image_recon": image_recon,
-                    "image_init": image_init,
-                    "csm": csm,
-                    "id": b["id"],
+                    "t": 1,
+                    "ph": -1,
+                    "z": 1,
+                    "h": -1,
+                    "w": -1,
                 }
             )
-        return results
+            xarray_ds.to_zarr(xarray_ds.encoding["source"], mode="a")
+
+        image_recon = for_vmap(
+            _predict,
+            (0, 0, 0, 0),
+            0,
+            None,
+        )(
+            torch.from_numpy(xarray_ds["kspace_data_compensated_odd"].values),
+            torch.from_numpy(xarray_ds["kspace_traj_odd"].values),
+            torch.from_numpy(xarray_ds["kspace_data_cse_odd"].values),
+            torch.from_numpy(xarray_ds["kspace_traj_cse_odd"].values),
+        )
+        print(image_recon.shape)
+        # p_odd = multi_processing_save_data(image_recon, lambda x: _save(x, "P2PCSE_odd"))
+        _save(image_recon, "P2PCSE_odd")
+        image_recon = for_vmap(
+            _predict,
+            (0, 0, 0, 0),
+            0,
+            None,
+        )(
+            torch.from_numpy(xarray_ds["kspace_data_compensated_even"].values),
+            torch.from_numpy(xarray_ds["kspace_traj_even"].values),
+            torch.from_numpy(xarray_ds["kspace_data_cse_even"].values),
+            torch.from_numpy(xarray_ds["kspace_traj_cse_even"].values),
+        )
+        print(image_recon.shape)
+        _save(image_recon, "P2PCSE_even")
+        # p_even = multi_processing_save_data(image_recon, lambda x: _save(x, "P2PCSE_even"))
+
+    def on_predict_epoch_end(self) -> None:
+        return super().on_predict_epoch_end()
+
+    def test_step(
+        self,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> Any:
+        xarray_ds = batch[0]
+        print(xarray_ds.attrs["id"])
+
+        def _predict(kspace_data, kspace_traj, kspace_data_cse, kspace_traj_cse):
+            image_recon, image_init, csm = self.forward_contrast(
+                kspace_data,
+                kspace_traj,
+                kspace_data_cse.unsqueeze(0),
+                kspace_traj_cse,
+                storage_device=torch.device("cpu"),
+            )
+            # xarray_ds["P2PCSE_odd"][]
+            return image_recon
+
+        def _save(data):
+            ds = xr.Dataset(
+                {
+                    "P2PCSE": xr.Variable(
+                        data=data.numpy(force=True), dims=["t", "ph", "z", "h", "w"]
+                    )
+                }
+            ).chunk(
+                {
+                    "t": 1,
+                    "ph": -1,
+                    "z": 1,
+                    "h": -1,
+                    "w": -1,
+                }
+            )
+            val_folder = Path(xarray_ds.encoding["source"]).parent
+            ds.to_zarr(
+                val_folder / (xarray_ds.attrs["id"] + "_P2PCSE.zarr"), mode="a"
+            )
+
+        image_recon = for_vmap(
+            _predict,
+            (0, 0, 0, 0),
+            0,
+            None,
+        )(
+            torch.from_numpy(xarray_ds["kspace_data_compensated"].values),
+            torch.from_numpy(xarray_ds["kspace_traj"].values),
+            torch.from_numpy(xarray_ds["kspace_data_cse"].values),
+            torch.from_numpy(xarray_ds["kspace_traj_cse"].values),
+        )
+        print(image_recon.shape)
+        # p_odd = multi_processing_save_data(image_recon, lambda x: _save(x, "P2PCSE_odd"))
+        _save(image_recon)
+
+    def forward_contrast(
+        self,
+        kspace_data,
+        kspace_traj,
+        kspace_data_cse,
+        kspace_traj_cse,
+        storage_device=torch.device("cpu"),
+    ):
+        """
+        kspace_data: [ph, ch, z, len]
+        kspace_traj: [ph, 2, len]
+        """
+        with torch.no_grad():
+            csm = self.nufft_adj_forward(
+                kspace_data_cse.to(self.device),
+                kspace_traj_cse.to(self.device),
+            )
+            csm = self.cse_forward(csm)
+            image_init = for_vmap(
+                lambda x, csm: torch.sum(
+                    self.nufft_adj_forward(x, kspace_traj.to(self.device)) * csm.conj(),
+                    dim=1,
+                ).to(storage_device),
+                (2, 2),
+                1,
+                10,
+            )(kspace_data.to(self.device), csm)
+            if self.inferer is None:
+                image_recon = self.recon_module(image_init.unsqueeze(0)).squeeze(0)
+            else:
+                image_recon = self.inferer(
+                    image_init.unsqueeze(0), self.recon_module
+                ).squeeze(0)
+        return image_recon, image_init, csm
 
     def configure_optimizers(self):
         recon_optimizer = self.recon_optimizer(
@@ -453,10 +519,3 @@ class P2PCSE_KXKYZ(L.LightningModule):
             lr=self.recon_lr,
         )
         return recon_optimizer
-
-    # def transfer_batch_to_device(self, batch, device, dataloader_idx):
-    # if self.trainer.training:
-    #     batch = super().transfer_batch_to_device(batch, device, dataloader_idx)
-    # else:
-    #     batch = batch
-    # return batch

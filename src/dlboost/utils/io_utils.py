@@ -1,9 +1,10 @@
 import os
 import torch
 import numpy as np
-import tifffile as tiff
-import torch.nn.functional as F
 from nibabel import load 
+from torch import multiprocessing as mp
+import torch
+from lightning.pytorch.callbacks import BasePredictionWriter
 
 def read_analyze_format(path):
     img = load(path)
@@ -65,7 +66,6 @@ def dict2md_table(ipt: dict):
     return ret
 
 
-
 def write_test(log_dict, img_dict, save_path, is_save_mat=False, is_save_tiff=True):
     if log_dict:
         # Write Log_dict Information
@@ -99,6 +99,21 @@ def write_test(log_dict, img_dict, save_path, is_save_mat=False, is_save_tiff=Tr
             if key_ in img_dict:
                 print(key_, img_dict[key_].shape)
                 to_tiff(img_dict[key_], save_path + key_ + '.tiff', is_normalized=False)
+
+def multi_processing_save_data(data, save_func):
+    queue = mp.Queue()
+    def task(queue):
+        while True:
+            data_remote = queue.get()
+            if data_remote is None:
+                break
+            save_func(data_remote)
+    writer_process = mp.Process(target=task, args=(queue,))
+    writer_process.start()
+    queue.put(data)
+    queue.put(None)
+    return writer_process, queue
+
 if __name__ == '__main__':
 
     # test for heatmap

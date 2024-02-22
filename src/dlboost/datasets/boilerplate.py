@@ -4,9 +4,9 @@ from typing import Any, Literal, Optional, Sequence
 import lightning.pytorch as pl
 import nibabel as nib
 import torch
+import xarray as xr
 from mrboost import reconstruction as recon
 from mrboost import computation as comp
-from mrboost.io_utils import to_nifty
 # from monai.data.image_reader import ImageReader
 import zarr
 from einops import rearrange#, reduce, repeat
@@ -32,11 +32,12 @@ def recon_one_scan(dat_file_to_recon, phase_num=5, time_per_contrast=10):
         kspace_data_z * kspace_density_compensation[:, :, None, None, :, :]*1000)
     return_data["kspace_density_compensation"] = kspace_density_compensation[:,
                                                                              :, None, None, :, :]
-    print(kspace_traj.shape)  # torch.Size([34, 5, 2, 15, 640])
-    return_data["kspace_traj"] = (kspace_traj[:, :, 0]+1j*kspace_traj[:, :, 1])[
-        :, :, None, None, :, :]  # .expand(kspace_data_z.shape)
+    # print(kspace_traj.shape)  # torch.Size([34, 5, 2, 15, 640])
+    # return_data["kspace_traj"] = (kspace_traj[:, :, 0]+1j*kspace_traj[:, :, 1])[
+    #     :, :, None, None, :, :]
+    return_data["kspace_traj"] = kspace_traj
     return_data["cse"] = cse
-
+    # print(return_data["cse"].shape) # [15, 80, 320, 320]
     return return_data
 
 

@@ -23,10 +23,9 @@ import lightning.pytorch as pl
 # from dlboost.tasks.boilerplate import *
 # from dlboost.tasks.boilerplate_P2PCSE import *
 from dlboost.tasks.boilerplate_P2PCSE_KXKYZ import P2PCSE_KXKYZ
-from torch import nn, optim
 
-class Recon(P2PCSE_KXKYZ, pl.LightningModule):
-    def __init__(self, recon_module, cse_module, nufft_im_size=..., patch_size=..., ch_pad=42, recon_loss_fn=nn.MSELoss, smooth_loss_coef=0.1, recon_optimizer=optim.Adam, recon_lr=0.0001, **kwargs):
-        super().__init__(recon_module, cse_module, nufft_im_size, patch_size, ch_pad, recon_loss_fn, recon_optimizer, recon_lr, **kwargs)
+class Recon(P2PCSE_KXKYZ):
+    def __init__(self, nufft_im_size=..., patch_size=..., ch_pad=42, lr=0.0001, **kwargs):
+        super().__init__(nufft_im_size, patch_size, ch_pad, lr, **kwargs)
 
 
