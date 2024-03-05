@@ -14,7 +14,6 @@ from dlboost.utils.tensor_utils import _transfer_to_device, crop_tensor, pad_ten
 from dlboost.utils.type_utils import (
     Data_With_Location,
     Pad_Sizes,
-    Patches_With_Pad_Sizes,
 )
 
 
