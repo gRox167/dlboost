@@ -404,6 +404,7 @@ class Recon(pl.LightningModule):
         print(kspace_data.shape, kspace_traj.shape, csm.shape, mvf.shape)
         csm = self.cse_forward(csm)
         csm_mul_ph = csm.unsqueeze(1).expand(-1, 5, -1, -1, -1, -1)
+
         image_recon, image_recon_list = self.recon_module(
             image_init.to(self.device),
             kspace_data.to(self.device),
