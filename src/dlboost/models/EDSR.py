@@ -1,12 +1,9 @@
+from math import prod
+from random import shuffle
 
 import torch
-from random import shuffle
 import torch.nn as nn
-from math import prod
-# import torch.nn.functional as nnf
-from .building_blocks import activation_fn, ResBlock
 from einops.layers.torch import Rearrange
-
 from monai.apps.reconstruction.networks.nets.utils import (
     complex_normalize,
     divisible_pad_t,
@@ -15,8 +12,14 @@ from monai.apps.reconstruction.networks.nets.utils import (
     reshape_complex_to_channel_dim,
 )
 
+# import torch.nn.functional as nnf
+from .building_blocks import ResBlock, activation_fn
+
+
 class EDSR(nn.Module):
-    def __init__(self, dimension, n_resblocks, n_feats, in_channels=1, out_channels=1, act='gelu'):
+    def __init__(
+        self, dimension, n_resblocks, n_feats, in_channels=1, out_channels=1, act="gelu"
+    ):
         super().__init__()
 
         if dimension == 2:
@@ -29,22 +32,26 @@ class EDSR(nn.Module):
 
         m_body = [
             ResBlock(
-                dimension, n_feats, 3, act=activation_fn[act](),#, res_scale=res_scale
-            ) for _ in range(n_resblocks)
+                dimension,
+                n_feats,
+                3,
+                act=activation_fn[act](),  # , res_scale=res_scale
+            )
+            for _ in range(n_resblocks)
         ]
 
         m_body.append(conv_fn(n_feats, n_feats, 3, padding=3 // 2))
 
-        m_tail = [
-            conv_fn(n_feats, out_channels, 3, padding=3 // 2)
-        ]
+        m_tail = [conv_fn(n_feats, out_channels, 3, padding=3 // 2)]
 
         self.head = nn.Sequential(*m_head)
         self.body = nn.Sequential(*m_body)
         self.tail = nn.Sequential(*m_tail)
 
     def forward(self, x):
-        x = reshape_complex_to_channel_dim(torch.view_as_real(x))  # x will be of shape (B,C*2,H,W)
+        x = reshape_complex_to_channel_dim(
+            torch.view_as_real(x)
+        )  # x will be of shape (B,C*2,H,W)
         x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
         x = self.head(x)
 
@@ -59,32 +66,62 @@ class EDSR(nn.Module):
 
 
 class ShuffleEDSR(nn.Module):
-    def __init__(self, dimension, n_resblocks, n_feats, down_sample_rate=[1,2,2],in_channels=1, out_channels=1, act='gelu'):
+    def __init__(
+        self,
+        dimension,
+        n_resblocks,
+        n_feats,
+        down_sample_rate=[1, 2, 2],
+        in_channels=1,
+        out_channels=1,
+        act="gelu",
+    ):
         super().__init__()
 
         if dimension == 2:
             conv_fn = nn.Conv2d
-            shuffle = Rearrange('b c  (h h2) (w w2) -> b (c h2 w2) d h w')
-            unshuffle = Rearrange('b (c h2 w2) d h w -> b c (h h2) (w w2)', h2=down_sample_rate[1], w2=down_sample_rate[2])
+            shuffle = Rearrange("b c  (h h2) (w w2) -> b (c h2 w2) d h w")
+            unshuffle = Rearrange(
+                "b (c h2 w2) d h w -> b c (h h2) (w w2)",
+                h2=down_sample_rate[1],
+                w2=down_sample_rate[2],
+            )
         elif dimension == 3:
             conv_fn = nn.Conv3d
-            shuffle = Rearrange('b c (d d2) (h h2) (w w2) -> b (d2 h2 w2 c) d h w', d2=down_sample_rate[0], h2=down_sample_rate[1], w2=down_sample_rate[2])
-            unshuffle = Rearrange('b (d2 h2 w2 c) d h w -> b c (d d2) (h h2) (w w2)', d2=down_sample_rate[0], h2=down_sample_rate[1], w2=down_sample_rate[2])
+            shuffle = Rearrange(
+                "b c (d d2) (h h2) (w w2) -> b (d2 h2 w2 c) d h w",
+                d2=down_sample_rate[0],
+                h2=down_sample_rate[1],
+                w2=down_sample_rate[2],
+            )
+            unshuffle = Rearrange(
+                "b (d2 h2 w2 c) d h w -> b c (d d2) (h h2) (w w2)",
+                d2=down_sample_rate[0],
+                h2=down_sample_rate[1],
+                w2=down_sample_rate[2],
+            )
         else:
             raise ValueError()
-        m_head = [shuffle,conv_fn(in_channels*prod(down_sample_rate), n_feats, 3, padding=3 // 2)]
+        m_head = [
+            shuffle,
+            conv_fn(in_channels * prod(down_sample_rate), n_feats, 3, padding=3 // 2),
+        ]
 
         m_body = [
             ResBlock(
-                dimension, n_feats, 3, act=activation_fn[act](),#, res_scale=res_scale
-            ) for _ in range(n_resblocks)
+                dimension,
+                n_feats,
+                3,
+                act=activation_fn[act](),  # , res_scale=res_scale
+            )
+            for _ in range(n_resblocks)
         ]
 
         m_body.append(conv_fn(n_feats, n_feats, 3, padding=3 // 2))
 
         m_tail = [
-            conv_fn(n_feats, out_channels*prod(down_sample_rate), 3, padding=3 // 2),
-            unshuffle
+            conv_fn(n_feats, out_channels * prod(down_sample_rate), 3, padding=3 // 2),
+            unshuffle,
         ]
 
         self.head = nn.Sequential(*m_head)
@@ -143,8 +180,6 @@ class ShuffleEDSR(nn.Module):
 #             prior = prior.unsqueeze(2)
 
 #             x = x - self.gamma * (dc + self.tau * (x - prior))
-#             #TODO what does this step want to do?
 #             x_hat.append(x)
 
 #         return x0, x_hat, b1_input, b1
- 

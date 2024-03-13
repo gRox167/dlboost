@@ -121,9 +121,6 @@ class MR_Forward_Model_Static(nn.Module):
         self.N.generate_forward_operator(kspace_traj)
 
     def forward(self, _image):
-        # _image = (
-        #     image.clone()
-        # )  # TODO Think this thoroughly, when do we need clone for params
         # This is needed, because in torchkbnufft there are inplace operation on leaf tensor (requires_grad = True)
         image_5ph = self.M(_image) if self.M else _image.expand(-1, 5, -1, -1, -1)
         image_5ph_multi_ch = self.S(image_5ph)

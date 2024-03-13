@@ -1,30 +1,21 @@
 from functools import partial
 from types import NoneType
 from typing import (
-    Any,
-    Callable,
     Dict,
-    Generator,
-    Hashable,
-    List,
-    Mapping,
-    NotRequired,
-    Optional,
     Sequence,
-    Tuple,
-    TypedDict,
     Union,
 )
 
 import einops as eo
 import torch
+from jaxtyping import PyTree
+from optree import tree_map
 from plum import dispatch, overload
-from sympy import N
+from torch import Tensor
 from torch.nn import functional as f
+from xarray import DataArray
 
-from dlboost.utils.type_utils import (
-    Data_With_Location,
-)
+from dlboost.utils.type_utils import Data_With_Location, XArrayDevice
 
 
 @overload
@@ -44,6 +35,30 @@ def _transfer_to_device(
     data: Dict[str, Data_With_Location | torch.Tensor], device: torch.device
 ) -> Dict[str, Data_With_Location | torch.Tensor]:
     return {k: _transfer_to_device(v, device) for k, v in data.items()}
+
+
+@overload
+def _transfer_to_device(
+    data: PyTree[DataArray, "T"], device: torch.device
+) -> PyTree[torch.Tensor, "T"]:
+    return tree_map(lambda x: torch.from_numpy(x.values).to(device), data)
+
+# @overload
+# def _transfer_to_device(
+#     data: torch.Tensor,
+#     device: XArrayDevice,
+#     dims: Sequence[str],
+# ) -> PyTree[DataArray, "T"]:
+#     return DataArray( data= data.cpu().numpy(),dims = dims)
+
+
+@overload
+def _transfer_to_device(
+    data: PyTree[torch.Tensor, "T"],
+    device: XArrayDevice,
+    dims: PyTree[Sequence[str], "T"],
+) -> PyTree[DataArray, "T"]:
+    return tree_map(lambda x, d: DataArray( data= x.cpu().numpy(),dims = d), data, dims)
 
 
 @dispatch
@@ -239,7 +254,7 @@ def interpolate(img, scale_factor, mode, align_corners=True):
         return torch.complex(r, i)
 
 
-def pad_tensor(input_tensor, dims, pad_sizes, mode="constant", value=0):
+def pad(data: Tensor, dims, pad_sizes, mode="constant", value=0):
     # Create a padding configuration tuple
     # The tuple should have an even number of elements, with the form:
     # (pad_left, pad_right, pad_top, pad_bottom, ...)
@@ -247,7 +262,7 @@ def pad_tensor(input_tensor, dims, pad_sizes, mode="constant", value=0):
     # the correct positions in the tuple for pad_size_1 and pad_size_2.
 
     # Initialize padding configuration with zeros for all dimensions
-    pad_config = [0] * (input_tensor.dim() * 2)
+    pad_config = [0] * (data.dim() * 2)
     # Set the padding sizes for the specified dimensions
     for dim, (pad_size_1, pad_size_2) in zip(dims, pad_sizes):
         # Calculate the indices in the padding configuration tuple
@@ -261,12 +276,19 @@ def pad_tensor(input_tensor, dims, pad_sizes, mode="constant", value=0):
 
     # Convert the list to a tuple and apply padding
     pad_config = tuple(pad_config)
-    return f.pad(input_tensor, pad_config, mode=mode, value=value)
+    return f.pad(data, pad_config, mode=mode, value=value)
 
 
-def crop_tensor(input_tensor, dims, start_indices, crop_sizes):
+def pad(data: DataArray, pad_sizes, mode="constant", value=0):
+    # Apply padding using xarray's pad function
+    padded_DataArray = data.pad(pad_sizes, mode=mode, constant_values=value)
+    return padded_DataArray
+
+
+@overload
+def crop(data: Tensor, dims, start_indices, crop_sizes) -> Tensor:
     # Initialize slicing configuration with colons for all dimensions
-    slice_config = [slice(None)] * input_tensor.dim()
+    slice_config = [slice(None)] * data.dim()
 
     # Set the slicing configuration for the specified dimensions
     for dim, start_index, crop_size in zip(dims, start_indices, crop_sizes):
@@ -274,4 +296,39 @@ def crop_tensor(input_tensor, dims, start_indices, crop_sizes):
         slice_config[dim] = slice(start_index, start_index + crop_size)
 
     # Apply slicing
-    return input_tensor[tuple(slice_config)]
+    return data[tuple(slice_config)]
+
+
+# @overload
+# def crop(
+#     data: DataArray, start_indices: Dict[str, int], crop_sizes: Dict[str, int]
+# ) -> DataArray:
+#     # Apply cropping using xarray's isel function
+#     slices = {k: slice(start_indices[k], start_indices[k] + crop_sizes[k]) for k in start_indices.keys()}
+#     return data.isel(slices)
+
+@overload
+def crop(
+        data: PyTree[DataArray, "T"],
+        start_indices: PyTree[Dict[str, int], "T"],
+        crop_sizes: PyTree[Dict[str, int], "T"],
+) -> PyTree[DataArray, "T"]:
+    slices = tree_map(lambda x, y: slice(x, x + y), start_indices, crop_sizes)
+    return tree_map(
+        lambda x, y: x.isel(y), data, slices
+    )
+
+# @overload 
+# def crop(
+#     data: PyTree[torch.Tensor, "T"],
+#     start_indices: PyTree[Dict[str, int], "T"]
+#     crop_sizes: PyTree[Dict[str, int], "T"],
+# ) -> PyTree[torch.Tensor, "T"]:
+#     return tree_map(
+#         lambda x, y, z: crop(x, y, z), data, start_indices, crop_sizes
+#     )
+
+
+@dispatch
+def crop(data, dims, start_indices, crop_sizes):
+    pass

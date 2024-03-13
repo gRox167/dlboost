@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+
 # import torch.nn.functional as nnf
 from torch.distributions.normal import Normal
+
 from .building_blocks import ConvBlock
 from .SpatialTransformNetwork import SpatialTransformNetwork
 
@@ -9,7 +11,7 @@ from .SpatialTransformNetwork import SpatialTransformNetwork
 # Registration Neutral Network
 ####################################
 
-#Some implementation here is adopted from VoxelMorph.
+# Some implementation here is adopted from VoxelMorph.
 
 
 # noinspection PyUnresolvedReferences
@@ -53,7 +55,9 @@ class unet_core(nn.Module):
         if self.vm2:
             self.vm2_conv = ConvBlock(dim, dec_nf[5], dec_nf[6])
 
-        self.upsample = nn.Upsample(scale_factor=2 if dim == 2 else (1, 2, 2), mode='nearest')
+        self.upsample = nn.Upsample(
+            scale_factor=2 if dim == 2 else (1, 2, 2), mode="nearest"
+        )
 
     def forward(self, x):
         """
@@ -110,18 +114,22 @@ class VoxelMorph(nn.Module):
         self.unet_model = unet_core(dim, enc_nf, dec_nf, full_size)
 
         # One conv to get the flow field
-        conv_fn = getattr(nn, 'Conv%dd' % dim)
+        conv_fn = getattr(nn, "Conv%dd" % dim)
         self.flow = conv_fn(dec_nf[-1], dim, kernel_size=3, padding=1)
 
         # Make flow weights + bias small. Not sure this is necessary.
         nd = Normal(0, 1e-5)
-        self.flow.weight = nn.Parameter(nd.sample(self.flow.weight.shape), requires_grad=True)
-        self.flow.bias = nn.Parameter(torch.zeros(self.flow.bias.shape), requires_grad=True)
+        self.flow.weight = nn.Parameter(
+            nd.sample(self.flow.weight.shape), requires_grad=True
+        )
+        self.flow.bias = nn.Parameter(
+            torch.zeros(self.flow.bias.shape), requires_grad=True
+        )
 
-        self.spatial_transform = SpatialTransformNetwork(vol_size)#, dims=dim)
+        self.spatial_transform = SpatialTransformNetwork(vol_size)  # , dims=dim)
 
     def forward(self, src, tgt, to_warp=None):
-        """ # TODO: t is not used
+        """
         Pass input x through forward once
             :param src: moving image that we want to shift
             :param tgt: fixed image that we want to shift to
@@ -134,6 +142,3 @@ class VoxelMorph(nn.Module):
         # y = self.spatial_transform(to_warp, flow)
 
         return y, flow
-
-
-

@@ -1764,6 +1764,21 @@ url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
 reference = "jaxlib"
 
 [[package]]
+name = "jaxtyping"
+version = "0.2.27"
+description = "Type annotations and runtime checking for shape and dtype of JAX arrays, and PyTrees."
+optional = false
+python-versions = "~=3.9"
+files = [
+    {file = "jaxtyping-0.2.27-py3-none-any.whl", hash = "sha256:a8eafc92106887e5d8e1ce148d5b236afaf2ee63f2b5bca3adb78aa08ae674ab"},
+    {file = "jaxtyping-0.2.27.tar.gz", hash = "sha256:4bfa972aefe24b246499eba6a63dec3aded1e8ba3b5b07d498408d08995e78a1"},
+]
+
+[package.dependencies]
+numpy = ">=1.20.0"
+typeguard = "2.13.3"
+
+[[package]]
 name = "jedi"
 version = "0.19.1"
 description = "An autocompletion tool for Python that can be used for text editors."
@@ -5818,6 +5833,21 @@ tests = ["autopep8", "flake8", "isort", "numpy", "pytest", "scipy (>=1.7.1)", "t
 tutorials = ["matplotlib", "pandas", "tabulate", "torch"]
 
 [[package]]
+name = "typeguard"
+version = "2.13.3"
+description = "Run-time type checker for Python"
+optional = false
+python-versions = ">=3.5.3"
+files = [
+    {file = "typeguard-2.13.3-py3-none-any.whl", hash = "sha256:5e3e3be01e887e7eafae5af63d1f36c849aaa94e3a0112097312aabfa16284f1"},
+    {file = "typeguard-2.13.3.tar.gz", hash = "sha256:00edaa8da3a133674796cf5ea87d9f4b4c367d77476e185e80251cc13dfbb8c4"},
+]
+
+[package.extras]
+doc = ["sphinx-autodoc-typehints (>=1.2.0)", "sphinx-rtd-theme"]
+test = ["mypy", "pytest", "typing-extensions"]
+
+[[package]]
 name = "typer"
 version = "0.9.0"
 description = "Typer, build great CLIs. Easy to code. Based on Python type hints."
@@ -6354,4 +6384,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11"
-content-hash = "31d2bb944dc11af4c1561527c14b893baa73c3e6c520acfb133112c5daa8ec2b"
+content-hash = "a1257f5fdd813b65187da544305c666693e3f28b12ffe4c94fb9a55eedd9f758"

@@ -1,69 +1,78 @@
-
 from dataclasses import dataclass
-from sklearn.metrics import dcg_score
+from math import prod
+from typing import Optional, Sequence, Tuple, Union
+
 import torch
+from einops.layers.torch import Rearrange
+from sklearn.metrics import dcg_score
 from torch import nn
 from torch.nn import functional as F
-from typing import Sequence, Union, Tuple, Optional
-from einops.layers.torch import Rearrange
-from math import prod
-
 from torchkbnufft import AdjKbNufft, KbNufft
 
 
 class UnrollingRED(nn.Module):
-    def __init__(self, data_consistency_module, regularization_module, iterations, gamma_init=1.0, tau_init=1.0):
+    def __init__(
+        self,
+        data_consistency_module,
+        regularization_module,
+        iterations,
+        gamma_init=1.0,
+        tau_init=1.0,
+    ):
         super().__init__()
         self.data_consistency_module = data_consistency_module
         self.regularization_module = regularization_module
         self.iterations = iterations
-        self.gamma = torch.nn.Parameter(torch.ones(self.iterations,) * gamma_init)
-        self.tau = torch.nn.Parameter(torch.ones(self.iterations,) * tau_init)
+        self.gamma = torch.nn.Parameter(
+            torch.ones(
+                self.iterations,
+            )
+            * gamma_init
+        )
+        self.tau = torch.nn.Parameter(
+            torch.ones(
+                self.iterations,
+            )
+            * tau_init
+        )
 
     def forward(self, x):
         # y = x.clone()
         for i in range(self.iterations):
-            dc = self.data_consistency_module(x.image,x.data)
-            reg = self.regularization_module(x) # and update csm
+            dc = self.data_consistency_module(x.image, x.data)
+            reg = self.regularization_module(x)  # and update csm
             x.data = x.data - self.gamma * dc + self.tau * reg
         return x
-        
+
+
 class P2PCSEDataConsistencyModule(nn.Module):
     def __init__(self, kbnufft_op, adjkbnufft_op):
         super().__init__()
         self.kbnufft_op = kbnufft_op
         self.adjkbufft_op = adjkbnufft_op
-    
+
     def kbnufft(self, x):
         return self.kbnufft_op(x.data, x.omega)
-    
+
     def forward(self, x, y):
         # x_image = x.image.clone().detach()
-        l = 1/2 * torch.norm(self.kbnufft(x)-y.data)**2 # do i need to stop gradient here?
-        gradient = torch.autograd.grad(l, x) #, create_graph=True)
+        l = (
+            1 / 2 * torch.norm(self.kbnufft(x) - y.data) ** 2
+        )  # do i need to stop gradient here?
+        gradient = torch.autograd.grad(l, x)  # , create_graph=True)
         return gradient
+
 
 class P2PCSERegularizationModule(nn.Module):
     def __init__(self, recon_module, cse_module):
         super().__init__()
         self.recon_module = recon_module
         self.cse_module = cse_module
-    
+
     def forward(self, x):
         x.csm = self.cse_module(x.csm)
-        x_ch = self.recon_module(torch.sum(
-            x.image * x.csm.conj(), dim=1))
+        x_ch = self.recon_module(torch.sum(x.image * x.csm.conj(), dim=1))
         return x_ch * x.csm
-    
-
-        
-
-        
-        
-
-
-
-
 
         # b1 = b1_divided_by_rss(b1)
         # b1_input = b1
@@ -89,8 +98,6 @@ class P2PCSERegularizationModule(nn.Module):
         #     prior = prior.unsqueeze(2)
 
         #     x = x - self.gamma * (dc + self.tau * (x - prior))
-        #     #TODO what does this step want to do?
         #     x_hat.append(x)
 
         # return x0, x_hat, b1_input, b1
- 

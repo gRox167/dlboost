@@ -1,14 +1,15 @@
 from copy import deepcopy
-import torch
-from torch import nn, vmap
-import torchkbnufft as tkbn
 
+import torch
+import torchkbnufft as tkbn
 import torchopt
-from dlboost.models import SpatialTransformNetwork, ComplexUnet, DWUNet
-from dlboost.utils.tensor_utils import interpolate
-from einops import rearrange, repeat, reduce
+from einops import rearrange, reduce, repeat
+from torch import nn, vmap
 from torch.nn import functional as f
 from torchopt import pytree
+
+from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
+from dlboost.utils.tensor_utils import interpolate
 
 
 class CSM_DynPh(nn.Module):
@@ -138,9 +139,7 @@ class MR_Forward_Model_Static(nn.Module):
         self.N.generate_forward_operator(kspace_traj)
 
     def forward(self, image):
-        _image = (
-            image.clone()
-        )  # TODO Think this thoroughly, when do we need clone for params
+        _image = image.clone()
         image_5ph = self.M(_image) if self.M else _image.expand(-1, 5, -1, -1, -1)
         image_5ph_multi_ch = self.S(image_5ph)
         # kspace_data_estimated = self.N(image)

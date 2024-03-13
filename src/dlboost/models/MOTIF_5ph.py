@@ -1,9 +1,8 @@
 import torch
+import torchkbnufft as tkbn
+from einops import rearrange, repeat
 from torch import nn
 from torch.nn import functional as f
-
-from einops import rearrange, repeat
-import torchkbnufft as tkbn
 
 from dlboost.models import SpatialTransformNetwork
 from dlboost.utils.tensor_utils import interpolate
@@ -204,7 +203,6 @@ class MOTIF_Unrolling(nn.Module):
         csm = self.data_consistency_module.forward_model.CSE_module.kernel_estimate(
             kspace_data_csm, kspace_traj_csm
         )
-        mvf = None  # TODO to be generated
         for t in range(self.iterations):
             # x_ph_list = []
             # for i, x_ph in enumerate(x):

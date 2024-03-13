@@ -1,29 +1,25 @@
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    Hashable,
-    List,
-    Mapping,
-    NotRequired,
-    Optional,
-    Sequence,
-    Tuple,
-    TypedDict,
-    Union,
-)
+from typing import Any, Dict, Literal, NotRequired, Sequence, Tuple, TypedDict, Union
 
-import torch
+from jaxtyping import Array, Complex, Float, PyTree, Shaped
+from torch import Size, Tensor
 
-Location = Tuple[slice, ...]
+KspaceData = Complex[Tensor, "length"]
+KspaceTraj = Float[Tensor, "2 length"]
+ComplexImage2D = Complex[Tensor, "h w"] | Float[Tensor, "h w"]
+ComplexImage3D = Shaped[ComplexImage2D, "d"]
+
+
+Location = Sequence[slice]
 Data_With_Location = Tuple[Any, Location]
-Pad_Sizes = Sequence[Tuple[int, int]]
-Patches_With_Pad_Sizes = TypedDict(
-    "Patches_With_Pad_Sizes",
+PadSizes = Sequence[Tuple[int, int]]
+NamedSize = Dict[str, int]
+Patches_With_PadSizes = TypedDict(
+    "Patches_With_PadSizes",
     {
         "patches": Sequence[Data_With_Location],
-        "pad_sizes": NotRequired[Pad_Sizes],
-        "padded_size": NotRequired[torch.Size],
+        "pad_sizes": NotRequired[PadSizes],
+        "padded_size": NotRequired[Size],
     },
 )
+
+XArrayDevice = Literal["xarray", "disk", "xa"]

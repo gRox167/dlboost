@@ -1,5 +1,6 @@
-from typing import Any
 from pathlib import Path
+from typing import Any
+
 import dask.array as da
 import lightning as L
 import torch
@@ -8,54 +9,24 @@ import xarray as xr
 import zarr
 from dlboost.models import ComplexUnet, DWUNet
 from dlboost.utils import to_png
+from dlboost.utils.io_utils import multi_processing_save_data
+from dlboost.utils.patch_utils import cutoff_filter, infer, split_tensor
 from dlboost.utils.tensor_utils import for_vmap, interpolate
 from einops import rearrange  # , reduce, repeat
-from monai.inferers import PatchInferer, SlidingWindowSplitter
-from torch import optim
+from jaxtyping import Shaped
+from mrboost.computation import nufft_2d, nufft_adj_2d
+from plum import activate_autoreload
+
+activate_autoreload()
+from dlboost.utils.type_utils import (
+    ComplexImage2D,
+    ComplexImage3D,
+    KspaceData,
+    KspaceTraj,
+)
+from plum import dispatch, overload
+from torch import P, optim
 from torch.nn import functional as f
-from dlboost.utils.io_utils import multi_processing_save_data
-
-
-def postprocessing(x):
-    x[:, :, [0, 3], ...] = 0
-    return 2 * x  # compensate for avg merger from monai
-
-
-def nufft_adj_gpu(
-    kspace_data,
-    kspace_traj,
-    nufft_adj,
-    csm=None,
-    inference_device=torch.device("cuda"),
-    storage_device=torch.device("cpu"),
-):
-    image_init = nufft_adj(
-        kspace_data.to(inference_device), kspace_traj.to(inference_device)
-    )
-    if csm is not None:
-        result_reduced = torch.sum(image_init * csm.conj().to(inference_device), dim=1)
-        return result_reduced.to(storage_device)
-    else:
-        return image_init.to(storage_device)
-
-
-def gradient_loss(s, penalty="l2", reduction="mean"):
-    if s.ndim != 4:
-        raise RuntimeError(f"Expected input `s` to be an 4D tensor, but got {s.shape}")
-    dy = torch.abs(s[:, :, 1:, :] - s[:, :, :-1, :])
-    dx = torch.abs(s[:, :, :, 1:] - s[:, :, :, :-1])
-    if penalty == "l2":
-        dy = dy * dy
-        dx = dx * dx
-    elif penalty == "l1":
-        pass
-    else:
-        raise NotImplementedError
-    if reduction == "mean":
-        d = torch.mean(dx) + torch.mean(dy)
-    elif reduction == "sum":
-        d = torch.sum(dx) + torch.sum(dy)
-    return d / 2.0
 
 
 class Recon(L.LightningModule):
@@ -102,9 +73,9 @@ class Recon(L.LightningModule):
         self.recon_lr = lr
         self.recon_optimizer = optim.AdamW
         self.nufft_im_size = nufft_im_size
-        self.nufft_op = tkbn.KbNufft(im_size=self.nufft_im_size)
-        self.nufft_adj = tkbn.KbNufftAdjoint(im_size=self.nufft_im_size)
-        self.teop_op = tkbn.ToepNufft()
+        # self.nufft_op = tkbn.KbNufft(im_size=self.nufft_im_size)
+        # self.nufft_adj = tkbn.KbNufftAdjoint(im_size=self.nufft_im_size)
+        # self.teop_op = tkbn.ToepNufft()
         self.patch_size = patch_size
         self.ch_pad = ch_pad
         self.downsample = lambda x: interpolate(
@@ -113,13 +84,21 @@ class Recon(L.LightningModule):
         self.upsample = lambda x: interpolate(
             x, scale_factor=(1, 2, 2), mode="trilinear"
         )
-        self.inferer = PatchInferer(
-            SlidingWindowSplitter(patch_size, overlap=(0.5, 0, 0), offset=(1, 0, 0)),
-            batch_size=8,
-            preprocessing=lambda x: x.to(self.device),
-            postprocessing=lambda x: postprocessing(x).to(torch.device("cpu")),
-            value_dtype=torch.complex64,
-        )
+        # self.inferer = PatchInferer(
+        #     SlidingWindowSplitter(patch_size, overlap=(0.5, 0, 0), offset=(1, 0, 0)),
+        #     batch_size=8,
+        #     preprocessing=lambda x: x.to(self.device),
+        #     postprocessing=lambda x: postprocessing(x).to(torch.device("cpu")),
+        #     value_dtype=torch.complex64,
+        # )
+
+        # nufft_op, nufft_adj_op = generate_nufft_op(nufft_im_size)
+        # self.nufft_cse = torch.vmap(nufft_op)  # image: b ch d h w; ktraj: b 2 len
+        # self.nufft_adj_cse = torch.vmap(nufft_adj_op)  # kdata: b ch d len
+        # self.nufft = torch.vmap(torch.vmap(nufft_op))
+        # # image: b ph ch d h w; ktraj: b ph 2 len
+        # self.nufft_adj = torch.vmap(torch.vmap(nufft_adj_op))
+        # # kdata: b ph ch d len
 
     def training_step(self, batch, batch_idx):
         recon_opt = self.optimizers()
@@ -156,8 +135,11 @@ class Recon(L.LightningModule):
             weight_reverse_sample_density, "sp len -> (sp len)"
         )
 
-        image_init_odd_ch = self.nufft_adj_forward(
-            kspace_data_cse_odd.unsqueeze(0), kspace_traj_cse_odd.unsqueeze(0)
+        # image_init_odd_ch = self.nufft_adj_forward(
+        #     kspace_data_cse_odd.unsqueeze(0), kspace_traj_cse_odd.unsqueeze(0)
+        # )
+        image_init_odd_ch = nufft_adj_2d(
+            kspace_data_cse_odd, kspace_traj_cse_odd, self.nufft_im_size
         )
         # shape is [1, ch, d, h, w]
 
@@ -165,8 +147,11 @@ class Recon(L.LightningModule):
         # csm_smooth_loss = self.smooth_loss_coef * self.smooth_loss_fn(csm_fixed)
         # self.log_dict({"recon/csm_smooth_loss": csm_smooth_loss})
 
-        image_init_odd = self.nufft_adj_forward(
-            kspace_data_compensated_odd, kspace_traj_odd
+        # image_init_odd = self.nufft_adj_forward(
+        #     kspace_data_compensated_odd, kspace_traj_odd
+        # )
+        image_init_odd = nufft_adj_2d(
+            kspace_data_compensated_odd, kspace_traj_odd, self.nufft_im_size
         )
         image_init_odd = torch.sum(image_init_odd * csm_odd.conj(), dim=1)
         # shape is [ph, d, h, w]
@@ -182,23 +167,25 @@ class Recon(L.LightningModule):
         # self.manual_backward(loss_f2m+csm_smooth_loss, retain_graph=True)
         self.log_dict({"recon/recon_loss": loss_o2e})
 
-        image_init_even_ch = self.nufft_adj_forward(
-            kspace_data_cse_even.unsqueeze(0), kspace_traj_cse_even.unsqueeze(0)
+        # image_init_even_ch = self.nufft_adj_forward(
+        #     kspace_data_cse_even.unsqueeze(0), kspace_traj_cse_even.unsqueeze(0)
+        # )
+        image_init_even_ch = nufft_adj_2d(
+            kspace_data_cse_even, kspace_traj_cse_even, self.nufft_im_size
         )
         # if self.global_step % 4 == 0:
         #     for ch in [0, 3, 5]:
         #         to_png(self.trainer.default_root_dir+f'/image_init_moved_ch{ch}.png',
         #                image_init_moved_ch[0, ch, 0, :, :])  # , vmin=0, vmax=2)
-        # image_init_moved_ch = self.nufft_adj_forward(
-        #     kspace_data_moved, kspace_traj_moved)
-        # shape is [ph, ch, h, w]
+
         csm_even = self.cse_forward(image_init_even_ch).expand(5, -1, -1, -1, -1)
         # csm_moved = self.cse_forward(image_init_moved_ch)
         # csm_smooth_loss = self.smooth_loss_coef * self.smooth_loss_fn(csm_moved)
 
-        image_init_even = self.nufft_adj_forward(
-            kspace_data_compensated_even, kspace_traj_even
+        image_init_even = nufft_adj_2d(
+            kspace_data_compensated_even, kspace_traj_even, self.nufft_im_size
         )
+
         image_init_even = torch.sum(image_init_even * csm_even.conj(), dim=1)
         # shape is [ph, h, w]
         image_recon_even = self.recon_module(image_init_even.unsqueeze(0)).squeeze(
@@ -253,38 +240,39 @@ class Recon(L.LightningModule):
         )
         return csm_hr_norm
 
-    def nufft_forward(self, image_init, kspace_traj):
+    """
+    def nufft_forward(self, image_init: PhChImage, kspace_traj: PhKspaceTraj):
         ph, ch, d, h, w = image_init.shape
         kspace_data = self.nufft_op(
             rearrange(image_init, "ph ch d h w -> ph (ch d) h w"),
             kspace_traj,
             norm="ortho",
         )
+        # self.nufft(image_init, kspace_traj, norm="ortho")
         return rearrange(kspace_data, "ph (ch d) len -> ph ch d len", ch=ch)
+    """
 
-    def nufft_adj_forward(self, kspace_data, kspace_traj):
-        ph, ch, d, length = kspace_data.shape
-        image = self.nufft_adj(
-            rearrange(kspace_data, "ph ch d len -> ph (ch d) len"),
-            kspace_traj,
-            norm="ortho",
-        )
-        return rearrange(image, "ph (ch d) h w -> ph ch d h w", ch=ch)
+    # def nufft_adj_forward(self, kspace_data, kspace_traj):
+    #     ph, ch, d, length = kspace_data.shape
+    #     image = self.nufft_adj(
+    #         rearrange(kspace_data, "ph ch d len -> ph (ch d) len"),
+    #         kspace_traj,
+    #         norm="ortho",
+    #     )
+    #     return rearrange(image, "ph (ch d) h w -> ph ch d h w", ch=ch)
 
     def calculate_recon_loss(
         self, image_recon, csm, kspace_traj, kspace_data, weight=None
     ):
-        # kernel = tkbn.calc_toeplitz_kernel(kspace_traj, im_size=self.nufft_im_size)
-        # image_HTH = self.teop_op(image_recon, kernel, smaps = csm, norm= 'ortho')
-        # image_HT = self.nufft_adj(kspace_data, kspace_traj, smaps = csm, norm= 'ortho')
-        kspace_data_estimated = self.nufft_forward(image_recon * csm, kspace_traj)
+        # kspace_data_estimated = self.nufft_forward(image_recon * csm, kspace_traj)
+        kspace_data_estimated = nufft_2d(
+            image_recon * csm, kspace_traj, self.nufft_im_size
+        )
 
         loss_not_reduced = self.recon_loss_fn(
             torch.view_as_real(weight * kspace_data_estimated),
             torch.view_as_real(kspace_data * weight),
         )
-        # self.recon_loss_fn(torch.view_as_real(
-        #     image_HTH), torch.view_as_real(image_HT))
         loss = torch.mean(loss_not_reduced)
         return loss
 
@@ -456,9 +444,7 @@ class Recon(L.LightningModule):
                 }
             )
             val_folder = Path(xarray_ds.encoding["source"]).parent
-            ds.to_zarr(
-                val_folder / (xarray_ds.attrs["id"] + "_P2PCSE.zarr"), mode="a"
-            )
+            ds.to_zarr(val_folder / (xarray_ds.attrs["id"] + "_P2PCSE.zarr"), mode="a")
 
         image_recon = for_vmap(
             _predict,
@@ -475,7 +461,75 @@ class Recon(L.LightningModule):
         # p_odd = multi_processing_save_data(image_recon, lambda x: _save(x, "P2PCSE_odd"))
         _save(image_recon)
 
-    def forward_contrast(
+    @overload
+    def forward(
+        self,
+        kspace_data: Shaped[KspaceData, "ph ch z"],
+        kspace_traj: Shaped[KspaceTraj, "ph"],
+        kspace_data_cse: Shaped[KspaceData, "ch z"],
+        kspace_traj_cse: KspaceTraj,
+        storage_device=torch.device("cpu"),
+    ):
+        """
+        kspace_data: [ph, ch, z, len]
+        kspace_traj: [ph, 2, len]
+        forward for one full contrast image
+        """
+        image_recon = infer(
+            {
+                "kspace_data": kspace_data,
+                "kspace_traj": kspace_traj,
+                "kspace_data_cse": kspace_data_cse,
+                "kspace_traj_cse": kspace_traj_cse,
+            },
+            self.forward,
+            {
+                "kspace_data": [2],
+                "kspace_traj": None,
+                "kspace_data_cse": [1],
+                "kspace_traj_cse": None,
+            },
+            {
+                "kspace_data": [self.patch_size[0]],
+                "kspace_traj": None,
+                "kspace_data_cse": [self.patch_size[0]],
+                "kspace_traj_cse": None,
+            },
+            {
+                "kspace_data": [0.5],
+                "kspace_traj": None,
+                "kspace_data_cse": [0.5],
+                "kspace_traj_cse": None,
+            },
+            split_func=split_tensor,
+            filter_func=cutoff_filter,
+            storage_device=storage_device,
+            device=self.device,
+        )
+        return image_recon
+
+    @overload
+    def forward(
+        self,
+        kspace_data: Shaped[KspaceData, "ph ch z"],
+        kspace_traj: Shaped[KspaceTraj, "ph"],
+        kspace_data_cse: Shaped[KspaceData, "ch z"],
+        kspace_traj_cse: KspaceTraj,
+    ):
+        """
+        kspace_data: [ph, ch, z, len]
+        kspace_traj: [ph, 2, len]
+        forward for one contrast patch
+        """
+        csm = nufft_adj_2d(kspace_data_cse, kspace_traj_cse, self.nufft_im_size)
+        csm = self.cse_forward(csm)
+        image_init_ch = nufft_adj_2d(kspace_data, kspace_traj, self.nufft_im_size)
+        image_init = torch.sum(image_init_ch * csm.conj(), dim=1)
+        image_recon = self.recon_module(image_init.unsqueeze(0)).squeeze(0)
+        return image_recon, image_init, csm
+
+    @dispatch
+    def forward(
         self,
         kspace_data,
         kspace_traj,
@@ -483,32 +537,7 @@ class Recon(L.LightningModule):
         kspace_traj_cse,
         storage_device=torch.device("cpu"),
     ):
-        """
-        kspace_data: [ph, ch, z, len]
-        kspace_traj: [ph, 2, len]
-        """
-        with torch.no_grad():
-            csm = self.nufft_adj_forward(
-                kspace_data_cse.to(self.device),
-                kspace_traj_cse.to(self.device),
-            )
-            csm = self.cse_forward(csm)
-            image_init = for_vmap(
-                lambda x, csm: torch.sum(
-                    self.nufft_adj_forward(x, kspace_traj.to(self.device)) * csm.conj(),
-                    dim=1,
-                ).to(storage_device),
-                (2, 2),
-                1,
-                10,
-            )(kspace_data.to(self.device), csm)
-            if self.inferer is None:
-                image_recon = self.recon_module(image_init.unsqueeze(0)).squeeze(0)
-            else:
-                image_recon = self.inferer(
-                    image_init.unsqueeze(0), self.recon_module
-                ).squeeze(0)
-        return image_recon, image_init, csm
+        pass
 
     def configure_optimizers(self):
         recon_optimizer = self.recon_optimizer(
@@ -519,3 +548,42 @@ class Recon(L.LightningModule):
             lr=self.recon_lr,
         )
         return recon_optimizer
+
+
+# def nufft_adj_gpu(
+#     kspace_data,
+#     kspace_traj,
+#     nufft_adj,
+#     csm=None,
+#     inference_device=torch.device("cuda"),
+#     storage_device=torch.device("cpu"),
+# ):
+#     image_init = nufft_adj(
+#         kspace_data.to(inference_device), kspace_traj.to(inference_device)
+#     )
+#     if csm is not None:
+#         result_reduced = torch.sum(image_init * csm.conj().to(inference_device), dim=1)
+#         return result_reduced.to(storage_device)
+#     else:
+#         return image_init.to(storage_device)
+# def postprocessing(x):
+#     x[:, :, [0, 3], ...] = 0
+#     return 2 * x  # compensate for avg merger from monai
+
+# def gradient_loss(s, penalty="l2", reduction="mean"):
+#     if s.ndim != 4:
+#         raise RuntimeError(f"Expected input `s` to be an 4D tensor, but got {s.shape}")
+#     dy = torch.abs(s[:, :, 1:, :] - s[:, :, :-1, :])
+#     dx = torch.abs(s[:, :, :, 1:] - s[:, :, :, :-1])
+#     if penalty == "l2":
+#         dy = dy * dy
+#         dx = dx * dx
+#     elif penalty == "l1":
+#         pass
+#     else:
+#         raise NotImplementedError
+#     if reduction == "mean":
+#         d = torch.mean(dx) + torch.mean(dy)
+#     elif reduction == "sum":
+#         d = torch.sum(dx) + torch.sum(dy)
+#     return d / 2.0
