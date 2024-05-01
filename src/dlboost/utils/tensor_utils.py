@@ -8,6 +8,7 @@ from typing import (
 
 import einops as eo
 import torch
+from icecream import ic
 from jaxtyping import PyTree
 from optree import tree_map
 from plum import dispatch, overload
@@ -15,55 +16,8 @@ from torch import Tensor
 from torch.nn import functional as f
 from xarray import DataArray
 
-from dlboost.utils.type_utils import Data_With_Location, XArrayDevice
 
 
-@overload
-def _transfer_to_device(data: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return data.to(device)
-
-
-@overload
-def _transfer_to_device(
-    data: Data_With_Location, device: torch.device
-) -> Data_With_Location:
-    return (_transfer_to_device(data[0], device), data[1])
-
-
-@overload
-def _transfer_to_device(
-    data: Dict[str, Data_With_Location | torch.Tensor], device: torch.device
-) -> Dict[str, Data_With_Location | torch.Tensor]:
-    return {k: _transfer_to_device(v, device) for k, v in data.items()}
-
-
-@overload
-def _transfer_to_device(
-    data: PyTree[DataArray, "T"], device: torch.device
-) -> PyTree[torch.Tensor, "T"]:
-    return tree_map(lambda x: torch.from_numpy(x.values).to(device), data)
-
-# @overload
-# def _transfer_to_device(
-#     data: torch.Tensor,
-#     device: XArrayDevice,
-#     dims: Sequence[str],
-# ) -> PyTree[DataArray, "T"]:
-#     return DataArray( data= data.cpu().numpy(),dims = dims)
-
-
-@overload
-def _transfer_to_device(
-    data: PyTree[torch.Tensor, "T"],
-    device: XArrayDevice,
-    dims: PyTree[Sequence[str], "T"],
-) -> PyTree[DataArray, "T"]:
-    return tree_map(lambda x, d: DataArray( data= x.cpu().numpy(),dims = d), data, dims)
-
-
-@dispatch
-def _transfer_to_device(data, device):
-    pass
 
 
 def complex_as_real_2ch(x):
@@ -281,6 +235,8 @@ def pad(data: Tensor, dims, pad_sizes, mode="constant", value=0):
 
 def pad(data: DataArray, pad_sizes, mode="constant", value=0):
     # Apply padding using xarray's pad function
+    # common_keys = data.dims & pad_sizes.keys()
+    # _pad_sizes = {k: pad_sizes[k] for k in common_keys}
     padded_DataArray = data.pad(pad_sizes, mode=mode, constant_values=value)
     return padded_DataArray
 
@@ -307,18 +263,18 @@ def crop(data: Tensor, dims, start_indices, crop_sizes) -> Tensor:
 #     slices = {k: slice(start_indices[k], start_indices[k] + crop_sizes[k]) for k in start_indices.keys()}
 #     return data.isel(slices)
 
+
 @overload
 def crop(
-        data: PyTree[DataArray, "T"],
-        start_indices: PyTree[Dict[str, int], "T"],
-        crop_sizes: PyTree[Dict[str, int], "T"],
+    data: PyTree[DataArray, "T"],
+    start_indices: PyTree[Dict[str, int], "T"],
+    crop_sizes: PyTree[Dict[str, int], "T"],
 ) -> PyTree[DataArray, "T"]:
     slices = tree_map(lambda x, y: slice(x, x + y), start_indices, crop_sizes)
-    return tree_map(
-        lambda x, y: x.isel(y), data, slices
-    )
+    return tree_map(lambda x, y: x.isel(y), data, slices)
 
-# @overload 
+
+# @overload
 # def crop(
 #     data: PyTree[torch.Tensor, "T"],
 #     start_indices: PyTree[Dict[str, int], "T"]

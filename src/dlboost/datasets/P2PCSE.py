@@ -4,20 +4,20 @@ import random
 from glob import glob
 from pathlib import Path
 
+import dask
+import numpy as np
 import torch
 import xarray as xr
-import numpy as np
-import zarr
 
 # from dataclasses import dataclass
 from dlboost.datasets.boilerplate import recon_one_scan
+from icecream import ic
 
 # from einops import rearrange
 from lightning.pytorch import LightningDataModule
 from mrboost import io_utils as iou
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader
-import dask
 
 
 # %%
@@ -68,6 +68,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             if len(glob(str(self.train_save_path / "*.zarr"))) == len(self.patient_ids):
                 train_integrate = True
         if not train_integrate:
+            # dask.config.set(scheduler="synchronous")
             self.generate_train_dataset(self.train_save_path)
 
         # self.val_save_path = self.cache_dir / str(self.fold_idx) / "val"
@@ -82,36 +83,38 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
     def generate_val_dataset(self, val_save_path):
         for p, patient_id in zip(self.dat_file_path_list, self.patient_ids):
             dat_file_to_recon = Path(self.data_dir) / p
-            if os.path.exists(val_save_path / (patient_id + ".zarr")):
+            zarr_path = val_save_path / (patient_id + ".zarr")
+            if os.path.exists(zarr_path):
                 continue
             raw_data = recon_one_scan(
                 dat_file_to_recon, phase_num=5, time_per_contrast=10
             )
-            if os.path.exists(val_save_path / (patient_id + ".zarr")):
-                continue
             ds = xr.Dataset(
                 data_vars=dict(
-                    kspace_data=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
+                    kspace_data=xr.DataArray(
                         raw_data["kspace_data_z"].numpy(),
+                        dims=["t", "ph", "ch", "z", "sp", "lens"],
                     ),
-                    kspace_data_compensated=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
+                    kspace_data_compensated=xr.DataArray(
                         raw_data["kspace_data_z_compensated"].numpy(),
+                        dims=["t", "ph", "ch", "z", "sp", "lens"],
                     ),
-                    kspace_data_cse=xr.Variable(
-                        ["t", "ph2", "ch", "z", "sp2", "lens2"],
+                    kspace_data_cse=xr.DataArray(
                         raw_data["kspace_data_z"][..., 240:400].numpy(),
+                        dims=["t", "ph2", "ch", "z", "sp2", "lens2"],
                     ),
-                    kspace_traj=xr.Variable(
-                        ["t", "ph", "complex", "sp", "lens"],
+                    kspace_traj=xr.DataArray(
                         raw_data["kspace_traj"].numpy(),
+                        dims=["t", "ph", "complex", "sp", "lens"],
                     ),
-                    kspace_traj_cse=xr.Variable(
-                        ["t", "ph2", "complex", "sp2", "lens2"],
+                    kspace_traj_cse=xr.DataArray(
                         raw_data["kspace_traj"][..., 240:400].numpy(),
+                        dims=["t", "ph2", "complex", "sp2", "lens2"],
                     ),
-                    cse=xr.Variable(["ch", "z", "h", "w"], raw_data["cse"].numpy()),
+                    cse=xr.DataArray(
+                        raw_data["cse"].numpy(),
+                        dims=["ch", "z", "h", "w"],
+                    ),
                 ),
                 attrs={"id": patient_id},
             )
@@ -133,60 +136,65 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
                 )
             )
             ds = ds.reset_index(list(ds.indexes))
-            ds.to_zarr(val_save_path / (patient_id + ".zarr"))
+            ds.to_zarr(zarr_path)
 
     def generate_train_dataset(self, train_save_path):
         # iou.check_mk_dirs(self.cache_dir / str(self.fold_idx))
+        # for p, patient_id in zip(self.dat_file_path_list, self.patient_ids):
         for p, patient_id in zip(self.dat_file_path_list, self.patient_ids):
             dat_file_to_recon = Path(self.data_dir) / p
-            if os.path.exists(train_save_path / (patient_id + ".zarr")):
+            zarr_path = train_save_path / (patient_id + ".zarr")
+            if os.path.exists(zarr_path):
                 continue
             raw_data = recon_one_scan(
                 dat_file_to_recon, phase_num=10, time_per_contrast=20
             )
             ds = xr.Dataset(
                 data_vars=dict(
-                    kspace_data_odd=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
+                    kspace_data_odd=xr.DataArray(
                         raw_data["kspace_data_z"][:, 0::2].numpy(),
+                        dims=["t", "ph", "ch", "z", "sp", "lens"],
                     ),
-                    kspace_data_even=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
+                    kspace_data_even=xr.DataArray(
                         raw_data["kspace_data_z"][:, 1::2].numpy(),
+                        dims=["t", "ph", "ch", "z", "sp", "lens"],
                     ),
-                    kspace_data_compensated_odd=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
+                    kspace_data_compensated_odd=xr.DataArray(
                         raw_data["kspace_data_z_compensated"][:, 0::2].numpy(),
+                        dims=["t", "ph", "ch", "z", "sp", "lens"],
                     ),
-                    kspace_data_compensated_even=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
+                    kspace_data_compensated_even=xr.DataArray(
                         raw_data["kspace_data_z_compensated"][:, 1::2].numpy(),
+                        dims=["t", "ph", "ch", "z", "sp", "lens"],
                     ),
-                    kspace_data_cse_odd=xr.Variable(
-                        ["t", "ph2", "ch", "z", "sp2", "lens2"],
+                    kspace_data_cse_odd=xr.DataArray(
                         raw_data["kspace_data_z"][:, 0::2, ..., 240:400].numpy(),
+                        dims=["t", "ph2", "ch", "z", "sp2", "lens2"],
                     ),
-                    kspace_data_cse_even=xr.Variable(
-                        ["t", "ph2", "ch", "z", "sp2", "lens2"],
+                    kspace_data_cse_even=xr.DataArray(
                         raw_data["kspace_data_z"][:, 1::2, ..., 240:400].numpy(),
+                        dims=["t", "ph2", "ch", "z", "sp2", "lens2"],
                     ),
-                    kspace_traj_odd=xr.Variable(
-                        ["t", "ph", "complex", "sp", "lens"],
+                    kspace_traj_odd=xr.DataArray(
                         raw_data["kspace_traj"][:, 0::2].numpy(),
+                        dims=["t", "ph", "complex", "sp", "lens"],
                     ),
-                    kspace_traj_even=xr.Variable(
-                        ["t", "ph", "complex", "sp", "lens"],
+                    kspace_traj_even=xr.DataArray(
                         raw_data["kspace_traj"][:, 1::2].numpy(),
+                        dims=["t", "ph", "complex", "sp", "lens"],
                     ),
-                    kspace_traj_cse_odd=xr.Variable(
-                        ["t", "ph2", "complex", "sp2", "lens2"],
+                    kspace_traj_cse_odd=xr.DataArray(
                         raw_data["kspace_traj"][:, 0::2, ..., 240:400].numpy(),
+                        dims=["t", "ph2", "complex", "sp2", "lens2"],
                     ),
-                    kspace_traj_cse_even=xr.Variable(
-                        ["t", "ph2", "complex", "sp2", "lens2"],
+                    kspace_traj_cse_even=xr.DataArray(
                         raw_data["kspace_traj"][:, 1::2, ..., 240:400].numpy(),
+                        dims=["t", "ph2", "complex", "sp2", "lens2"],
                     ),
-                    cse=xr.Variable(["ch", "z", "h", "w"], raw_data["cse"].numpy()),
+                    cse=xr.DataArray(
+                        raw_data["cse"].numpy(),
+                        dims=["ch", "z", "h", "w"],
+                    ),
                 ),
                 attrs={"id": patient_id},
             )
@@ -208,15 +216,14 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
                 )
             )
             ds = ds.reset_index(list(ds.indexes))
-            ds.to_zarr(train_save_path / (patient_id + ".zarr"))
+            ds.to_zarr(zarr_path)
 
     def setup(self, init=False, stage: str = "fit"):
-        dask.config.set(scheduler="synchronous")
         train_ds_list = [
-            str(self.cache_dir / "train" / f"{pid}.zarr")
-            for pid in self.patient_ids
+            str(self.cache_dir / "train" / f"{pid}.zarr") for pid in self.patient_ids
         ]
         if stage == "fit":
+            dask.config.set(scheduler="synchronous")
             sample = xr.open_zarr(train_ds_list[0])
             t = sample.sizes["t"]
             z = sample.sizes["z"]
@@ -235,9 +242,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
                 for z_idx in z_indices
             ]
         else:
-            self.train_dp = [
-                xr.open_zarr(ds) for ds in train_ds_list
-            ]
+            self.train_dp = [xr.open_zarr(ds) for ds in train_ds_list]
 
         val_ds_list = [
             str(self.cache_dir / "val" / f"{pid}.zarr")
@@ -245,14 +250,11 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             for pid in self.patient_ids
         ]
         self.val_dp = [
-            xr.open_zarr(ds).isel(t=slice(0, 1)) for ds in val_ds_list[2:3]
+            xr.open_zarr(ds).isel(t=slice(0, 1), z=slice(35, 45))
+            for ds in val_ds_list[2:3]
         ]
-        self.pred_dp = [
-            xr.open_zarr(ds) for ds in train_ds_list
-        ]
-        self.test_dp = [
-            xr.open_zarr(ds) for ds in val_ds_list
-        ]
+        self.pred_dp = [xr.open_zarr(ds) for ds in train_ds_list]
+        self.test_dp = [xr.open_zarr(ds) for ds in val_ds_list]
 
     def train_dataloader(self):
         return DataLoader(
@@ -273,10 +275,11 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             batch_size=self.val_batch_size,
             num_workers=0,
             pin_memory=False,
-            collate_fn=lambda batch_list: [
-                {k: torch.from_numpy(v.to_numpy()) for k, v in x.data_vars.items()}
-                for x in batch_list
-            ],
+            collate_fn=lambda x: x,
+            # collate_fn=lambda batch_list: [
+            #     {k: torch.from_numpy(v.to_numpy()) for k, v in x.data_vars.items()}
+            #     for x in batch_list
+            # ],
         )
 
     def predict_dataloader(self):
@@ -289,8 +292,8 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             #     (x, {k: torch.from_numpy(v.to_numpy()) for k, v in x.data_vars.items()})
             #     for x in batch_list
             # ],
-            collate_fn= lambda x: x
-            )
+            collate_fn=lambda x: x,
+        )
 
     def test_dataloader(self):
         return DataLoader(
@@ -302,8 +305,8 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             #     (x, {k: torch.from_numpy(v.to_numpy()) for k, v in x.data_vars.items()})
             #     for x in batch_list
             # ],
-            collate_fn= lambda x: x
-            )
+            collate_fn=lambda x: x,
+        )
 
     def transfer_batch_to_device(
         self, batch, device: torch.device, dataloader_idx: int

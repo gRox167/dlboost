@@ -24,6 +24,7 @@ class SpatialTransformNetwork(nn.Module):
 
     def forward(self, src, flow, return_phi=False):
         # new locations
+        print(self.grid.shape,flow.shape)
         new_locs = self.grid + flow
         shape = flow.shape[2:]
 

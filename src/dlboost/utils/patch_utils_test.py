@@ -6,52 +6,6 @@ from xarray import DataArray
 from dlboost.utils.patch_utils import cutoff_filter, infer, split_tensor
 from dlboost.utils.tensor_utils import _transfer_to_device
 
-# def test_one_tensor_patch_infer():
-#     input_tensor: torch.Tensor = torch.arange(1, 17).tile(1, 1, 16, 1)
-#     print(input_tensor.shape)
-#     func = lambda x: x
-#     output = infer(
-#         input_tensor,
-#         func,
-#         [2, 3],
-#         [4, 4],
-#         [0.5, 0.5],
-#         split_tensor,
-#         cutoff_filter,
-#     )
-#     assert torch.allclose(output, input_tensor)
-
-
-# def test_dict_tensor_patch_infer():
-#     input_dict = {
-#         "image": torch.arange(0, 16).tile(1, 1, 16, 1),
-#         "kspace": torch.arange(0, 32).tile(1, 15, 16, 1),
-#     }
-#     patch_dims = {
-#         "image": [2],
-#         "kspace": [2],
-#     }
-#     patch_sizes = {
-#         "image": [4],
-#         "kspace": [4],
-#     }
-#     overlap = {
-#         "image": [0.5],
-#         "kspace": [0.5],
-#     }
-#     func = lambda x: x["image"]
-#     output = infer(
-#         input_dict,
-#         func,
-#         patch_dims,
-#         patch_sizes,
-#         overlap,
-#         split_tensor,
-#         cutoff_filter,
-#         "image",
-#     )
-#     assert torch.allclose(output, input_dict["image"])
-
 
 def test_pytree_xarray_kspace_to_image_patch_infer():
     input_tree = [
@@ -112,3 +66,49 @@ def test_pytree_xarray_image_patch_infer():
         cutoff_filter,
     )
     assert torch.allclose(_transfer_to_device(output, torch.device("cpu")), _transfer_to_device(input_tree, torch.device("cpu")))
+
+# def test_one_tensor_patch_infer():
+#     input_tensor: torch.Tensor = torch.arange(1, 17).tile(1, 1, 16, 1)
+#     print(input_tensor.shape)
+#     func = lambda x: x
+#     output = infer(
+#         input_tensor,
+#         func,
+#         [2, 3],
+#         [4, 4],
+#         [0.5, 0.5],
+#         split_tensor,
+#         cutoff_filter,
+#     )
+#     assert torch.allclose(output, input_tensor)
+
+
+# def test_dict_tensor_patch_infer():
+#     input_dict = {
+#         "image": torch.arange(0, 16).tile(1, 1, 16, 1),
+#         "kspace": torch.arange(0, 32).tile(1, 15, 16, 1),
+#     }
+#     patch_dims = {
+#         "image": [2],
+#         "kspace": [2],
+#     }
+#     patch_sizes = {
+#         "image": [4],
+#         "kspace": [4],
+#     }
+#     overlap = {
+#         "image": [0.5],
+#         "kspace": [0.5],
+#     }
+#     func = lambda x: x["image"]
+#     output = infer(
+#         input_dict,
+#         func,
+#         patch_dims,
+#         patch_sizes,
+#         overlap,
+#         split_tensor,
+#         cutoff_filter,
+#         "image",
+#     )
+#     assert torch.allclose(output, input_dict["image"])
