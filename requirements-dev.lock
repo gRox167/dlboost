@@ -117,6 +117,8 @@ identify==2.5.36
 idna==3.7
     # via requests
     # via yarl
+imageio==2.34.1
+    # via dlboost
 importlib-metadata==7.1.0
     # via dask
 iniconfig==2.0.0
@@ -188,6 +190,7 @@ numpy==1.26.4
     # via einx
     # via flox
     # via h5py
+    # via imageio
     # via jaxtyping
     # via lightning
     # via matplotlib
@@ -268,6 +271,7 @@ partd==1.4.1
     # via dask
 pillow==10.3.0
     # via bokeh
+    # via imageio
     # via matplotlib
 platformdirs==4.2.1
     # via pooch

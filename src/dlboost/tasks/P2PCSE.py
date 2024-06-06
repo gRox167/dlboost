@@ -5,7 +5,6 @@ import dask.array as da
 import lightning as L
 import numpy as np
 import torch
-import torchkbnufft as tkbn
 import xarray as xr
 import zarr
 from dask.distributed import Client
