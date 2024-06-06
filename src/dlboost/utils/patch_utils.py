@@ -26,7 +26,7 @@ from plum import dispatch, overload
 from torch import Size, Tensor
 from xarray import DataArray
 
-from dlboost.utils.tensor_utils import _transfer_to_device, crop, pad
+from dlboost.utils.tensor_utils import crop, pad
 
 Location = Sequence[slice]
 Data_With_Location = Tuple[Any, Location]
