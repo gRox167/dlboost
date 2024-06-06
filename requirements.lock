@@ -375,8 +375,11 @@ torch==2.3.0
     # via lightning
     # via monai
     # via pytorch-lightning
+    # via torch-dct
     # via torchmetrics
     # via torchopt
+torch-dct==0.1.6
+    # via dlboost
 torchmetrics==1.3.2
     # via lightning
     # via pytorch-lightning
