@@ -18,6 +18,7 @@ from dlboost.NODEO.Network import BrainNet
 from dlboost.NODEO.NeuralODE import NeuralODE
 from dlboost.NODEO.Utils import (
     SpatialTransformer,
+    ResizeTransform,
     dice,
     generate_grid3D_tensor,
     load_nii,
@@ -119,7 +120,7 @@ def registration_main(config, device, moving, fixed):
     return best_df, best_df_with_grid, best_warped_moving
 
 
-def registration(device, moving, fixed, resample_ratio=0.25):
+def registration(device, moving, fixed):
     """
     Registration moving to fixed.
     :param config: configurations.
@@ -129,10 +130,8 @@ def registration(device, moving, fixed, resample_ratio=0.25):
     :return ode_train: neuralODE class.
     :return all_phi: Displacement field for all time steps.
     """
-    im_shape = fixed.shape
     # make batch dimension
-    moving = moving.unsqueeze(0).unsqueeze(0)
-    fixed = fixed.unsqueeze(0).unsqueeze(0)
+    im_shape = fixed.shape
 
     Network = BrainNet(
         img_sz=im_shape,
@@ -188,6 +187,7 @@ def registration(device, moving, fixed, resample_ratio=0.25):
                 best_df = df.detach().clone()
                 best_df_with_grid = df_with_grid.detach().clone()
                 best_warped_moving = warped_moving.detach().clone()
+    
     return best_df, best_df_with_grid, best_warped_moving
 
 
