@@ -53,6 +53,32 @@ class SpatialTransformer(nn.Module):
         else:
             return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
 
+
+
+class ResizeTransform(nn.Module):
+    """
+    Resize a transform, which involves resizing the vector field *and* rescaling it.
+    """
+
+    def __init__(self, factor, ndims):
+        super().__init__()
+        self.factor = factor
+        self.mode = 'linear'
+        if ndims == 2:
+            self.mode = 'bi' + self.mode
+        elif ndims == 3:
+            self.mode = 'tri' + self.mode
+        if factor<1:
+            self.interpolate = lambda x: factor * F.interpolate(x, align_corners=True, scale_factor=self.factor, mode=self.mode)
+        elif factor>1:
+            self.interpolate = lambda x:  F.interpolate(factor *x, align_corners=True, scale_factor=self.factor, mode=self.mode)
+        else:
+            # don't do anything if resize is 1
+            self.interpolate = lambda x: x
+            
+    def forward(self, x):
+        return self.interpolate(x)
+
 def load_nii(path):
     X = nib.load(path)
     X = X.get_fdata()

@@ -51,19 +51,21 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
         self.fold_idx = fold_idx
 
         self.dat_file_path_list = dat_file_path_list
+        
         self.patient_ids = [
-            (self.data_dir / p).parent.name for p in self.dat_file_path_list
+            (self.data_dir / p).parent.name+"_DB" if "_Dyn_DB.dat" in p else (self.data_dir / p).parent.name for p in self.dat_file_path_list 
         ]
 
         self.kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        self.train_idx, self.val_idx = [
-            (train, test) for train, test in self.kf.split(self.dat_file_path_list)
-        ][self.fold_idx]
+        # self.train_idx, self.val_idx = [
+        #     (train, test) for train, test in self.kf.split(self.dat_file_path_list)
+        # ][self.fold_idx]
 
     def prepare_data(self):
         # self.train_save_path = self.cache_dir / str(self.fold_idx) / "train"
         self.train_save_path = self.cache_dir / "train"
         train_integrate = False
+
         if os.path.exists(self.train_save_path):
             if len(glob(str(self.train_save_path / "*.zarr"))) == len(self.patient_ids):
                 train_integrate = True
@@ -83,6 +85,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
     def generate_val_dataset(self, val_save_path):
         for p, patient_id in zip(self.dat_file_path_list, self.patient_ids):
             dat_file_to_recon = Path(self.data_dir) / p
+            # zarr_path = val_save_path / (patient_id + "_DB.zarr")
             zarr_path = val_save_path / (patient_id + ".zarr")
             if os.path.exists(zarr_path):
                 continue
@@ -222,6 +225,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
         train_ds_list = [
             str(self.cache_dir / "train" / f"{pid}.zarr") for pid in self.patient_ids
         ]
+        ic(train_ds_list)
         if stage == "fit":
             dask.config.set(scheduler="synchronous")
             sample = xr.open_zarr(train_ds_list[0])
@@ -249,9 +253,11 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             # for pid in self.patient_ids[self.val_idx.tolist()]
             for pid in self.patient_ids
         ]
+        # print(val_ds_list)
+        # print(xr.open_zarr(val_ds_list[0]))
         self.val_dp = [
-            xr.open_zarr(ds).isel(t=slice(0, 1), z=slice(35, 45))
-            for ds in val_ds_list[2:3]
+            xr.open_zarr(ds).isel(t=slice(2,3), z=slice(0, 80))
+            for ds in val_ds_list
         ]
         self.pred_dp = [xr.open_zarr(ds) for ds in train_ds_list]
         self.test_dp = [xr.open_zarr(ds) for ds in val_ds_list]
