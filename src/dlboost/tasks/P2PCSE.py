@@ -122,14 +122,14 @@ class Recon(L.LightningModule):
 
         
         # kspace weighted loss
-        sp, len = 15, 640
-        weight = torch.arange(1, len // 2 + 1, device=kspace_data_odd.device)
-        weight_reverse_sample_density = torch.cat(
-            [weight.flip(0), weight], dim=0
-        ).expand(sp, len)
-        weight_reverse_sample_density = rearrange(
-            weight_reverse_sample_density, "sp len -> (sp len)"
-        )
+        # sp, len = 15, 640
+        # weight = torch.arange(1, len // 2 + 1, device=kspace_data_odd.device)
+        # weight_reverse_sample_density = torch.cat(
+        #     [weight.flip(0), weight], dim=0
+        # ).expand(sp, len)
+        # weight_reverse_sample_density = rearrange(
+        #     weight_reverse_sample_density, "sp len -> (sp len)"
+        # )
 
         image_recon_odd, image_init_odd, csm_odd = self.forward(
             kspace_data_compensated_odd, kspace_traj_odd, kspace_data_cse_odd, kspace_traj_cse_odd
@@ -140,7 +140,7 @@ class Recon(L.LightningModule):
             csm=csm_odd,
             kspace_traj=kspace_traj_even,
             kspace_data=kspace_data_even,
-            weight=weight_reverse_sample_density,
+            # weight=weight_reverse_sample_density,
         )
         self.manual_backward(loss_o2e, retain_graph=True)
         # self.manual_backward(loss_f2m+csm_smooth_loss, retain_graph=True)
@@ -158,7 +158,7 @@ class Recon(L.LightningModule):
             csm=csm_even,
             kspace_traj=kspace_traj_odd,
             kspace_data=kspace_data_odd,
-            weight=weight_reverse_sample_density,
+            # weight=weight_reverse_sample_density,
         )
         self.manual_backward(loss_e2o, retain_graph=True)
         # self.manual_backward(loss_m2f + csm_smooth_loss, retain_graph=True)
@@ -210,9 +210,12 @@ class Recon(L.LightningModule):
         kspace_data_estimated = nufft_2d(
             image_recon.unsqueeze(1).expand(-1,ch,-1,-1,-1) * csm, kspace_traj, self.nufft_im_size
         )
-
+        kspace_data_estimated_detatched = kspace_data_estimated.detach().abs()
+        norm_factor = kspace_data_estimated_detatched.max()
+        weight = 1 / ( kspace_data_estimated_detatched/norm_factor + 1e-5)
+        # weight /= weight.max()
         loss_not_reduced = self.recon_loss_fn(
-            torch.view_as_real(weight * kspace_data_estimated),
+            torch.view_as_real(kspace_data_estimated * weight),
             torch.view_as_real(kspace_data * weight),
         )
         loss = torch.mean(loss_not_reduced)
@@ -565,7 +568,8 @@ class Recon(L.LightningModule):
         )
         return recon_optimizer
 
-
+    def on_load_checkpoint(self, checkpoint):
+        checkpoint["optimizer_states"] = []
 # def nufft_adj_gpu(
 #     kspace_data,
 #     kspace_traj,

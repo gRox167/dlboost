@@ -225,7 +225,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
         train_ds_list = [
             str(self.cache_dir / "train" / f"{pid}.zarr") for pid in self.patient_ids
         ]
-        ic(train_ds_list)
+        # ic(train_ds_list)
         if stage == "fit":
             dask.config.set(scheduler="synchronous")
             sample = xr.open_zarr(train_ds_list[0])
@@ -257,7 +257,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
         # print(xr.open_zarr(val_ds_list[0]))
         self.val_dp = [
             xr.open_zarr(ds).isel(t=slice(2,3), z=slice(0, 80))
-            for ds in val_ds_list
+            for ds in val_ds_list[0:1]
         ]
         self.pred_dp = [xr.open_zarr(ds) for ds in train_ds_list]
         self.test_dp = [xr.open_zarr(ds) for ds in val_ds_list]
