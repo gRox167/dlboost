@@ -16,6 +16,7 @@ wheels/
 *.h5
 *.hdf5
 *.ckpt
+*.pyc
 
 *.m
 *.m~

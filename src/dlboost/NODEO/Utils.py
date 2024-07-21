@@ -1,17 +1,21 @@
-import numpy as np
+from dataclasses import dataclass
+
+import einx
 import nibabel as nib
-# from dlboost.NODEO.Loss import 
+import numpy as np
+
+# from dlboost.NODEO.Loss import
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
+
 
 class SpatialTransformer(nn.Module):
     """
     N-D Spatial Transformer
     """
 
-    def __init__(self, size, mode='bilinear'):
+    def __init__(self, size, mode="bilinear"):
         super().__init__()
 
         self.mode = mode
@@ -28,7 +32,7 @@ class SpatialTransformer(nn.Module):
         # is included when saving weights to disk, so the model files are way bigger
         # than they need to be. so far, there does not appear to be an elegant solution.
         # see: https://discuss.pytorch.org/t/how-to-register-buffer-without-polluting-state-dict
-        self.register_buffer('grid', grid)
+        self.register_buffer("grid", grid)
 
     def forward(self, src, flow, return_phi=False):
         # new locations
@@ -39,8 +43,9 @@ class SpatialTransformer(nn.Module):
         for i in range(len(shape)):
             new_locs[:, i, ...] = 2 * (new_locs[:, i, ...] / (shape[i] - 1) - 0.5)
 
-        # move channels dim to last position
-        # also not sure why, but the channels need to be reversed
+        # move channels dim to last position channel have the order of (z, y, x)
+        # because grid_sample expects the last dimension to specify the channel
+        # the grid_sample function expects ordering (x, y, z)
         if len(shape) == 2:
             new_locs = new_locs.permute(0, 2, 3, 1)
             new_locs = new_locs[..., [1, 0]]
@@ -49,56 +54,52 @@ class SpatialTransformer(nn.Module):
             new_locs = new_locs[..., [2, 1, 0]]
 
         if return_phi:
-            return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode), new_locs
+            return F.grid_sample(
+                src, new_locs, align_corners=True, mode=self.mode
+            ), new_locs
         else:
             return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
 
 
-
-class ResizeTransform(nn.Module):
+def resize_deformation_field(field, factor, ndims=3):
     """
-    Resize a transform, which involves resizing the vector field *and* rescaling it.
+    Resize a deformation field.
     """
+    if ndims == 2:
+        mode = "bilinear"
+    elif ndims == 3:
+        mode = "trilinear"
+    else:
+        raise ValueError("Only 2D and 3D supported")
+    _field = F.interpolate(field, scale_factor=factor, mode=mode, align_corners=True)
+    return einx.multiply(
+        "b [c] ...", _field, torch.tensor(factor, device=_field.device)
+    )
 
-    def __init__(self, factor, ndims):
-        super().__init__()
-        self.factor = factor
-        self.mode = 'linear'
-        if ndims == 2:
-            self.mode = 'bi' + self.mode
-        elif ndims == 3:
-            self.mode = 'tri' + self.mode
-        if factor<1:
-            self.interpolate = lambda x: factor * F.interpolate(x, align_corners=True, scale_factor=self.factor, mode=self.mode)
-        elif factor>1:
-            self.interpolate = lambda x:  F.interpolate(factor *x, align_corners=True, scale_factor=self.factor, mode=self.mode)
-        else:
-            # don't do anything if resize is 1
-            self.interpolate = lambda x: x
-            
-    def forward(self, x):
-        return self.interpolate(x)
 
 def load_nii(path):
     X = nib.load(path)
     X = X.get_fdata()
     return X
 
+
 def save_nii(img, savename):
     affine = np.diag([1, 1, 1, 1])
     new_img = nib.nifti1.Nifti1Image(img, affine, header=None)
     nib.save(new_img, savename)
 
+
 def generate_grid3D_tensor(shape):
-    x_grid = torch.linspace(-1., 1., shape[0])
-    y_grid = torch.linspace(-1., 1., shape[1])
-    z_grid = torch.linspace(-1., 1., shape[2])
+    x_grid = torch.linspace(-1.0, 1.0, shape[0])
+    y_grid = torch.linspace(-1.0, 1.0, shape[1])
+    z_grid = torch.linspace(-1.0, 1.0, shape[2])
     x_grid, y_grid, z_grid = torch.meshgrid(x_grid, y_grid, z_grid)
 
     # Note that default the dimension in the grid is reversed:
     # z, y, x
     grid = torch.stack([z_grid, y_grid, x_grid], dim=0)
     return grid
+
 
 def dice(array1, array2, labels):
     """
@@ -114,7 +115,7 @@ def dice(array1, array2, labels):
 
 
 @dataclass
-class Config():
+class Config:
     # registration
     smoothing_kernel = "AK"
     smoothing_win: int = 15

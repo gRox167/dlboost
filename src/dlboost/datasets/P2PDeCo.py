@@ -10,13 +10,14 @@ import xarray as xr
 
 # from einops import rearrange
 from lightning.pytorch import LightningDataModule
+from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Dataset
 
 # from dataclasses import dataclass
 from dlboost.datasets.boilerplate import recon_one_scan
 
 
-class P2PCSE_TRAIN(Dataset):
+class P2PDeCo_TRAIN(Dataset):
     def __init__(
         self,
         cache_dir,
@@ -90,14 +91,18 @@ class P2PCSE_TRAIN(Dataset):
         return get_data_dict(*self.train_idx[index])
 
 
-class P2PCSE_VAL(Dataset):
+class P2PDeCo_VAL(Dataset):
     def __init__(
-        self, cache_dir, patient_ids, t_slice=slice(None), z_slice=slice(None)
+        self,
+        cache_dir,
+        val_patient_ids,
+        t_slice=slice(None),
+        z_slice=slice(None),
     ):
         self.cache_dir = cache_dir
-        self.patient_ids = patient_ids
+        self.val_patient_ids = val_patient_ids
         self.val_kd = [
-            str(self.cache_dir / "val" / f"{pid}.zarr") for pid in self.patient_ids
+            str(self.cache_dir / "val" / f"{pid}.zarr") for pid in self.val_patient_ids
         ]
         self.t_slice = t_slice
         self.z_slice = z_slice
@@ -109,7 +114,7 @@ class P2PCSE_VAL(Dataset):
         return xr.open_zarr(self.val_kd[index]).isel(t=self.t_slice, z=self.z_slice)
 
 
-class P2PCSE_Predict(Dataset):
+class P2PDeCo_Predict(Dataset):
     def __init__(
         self, cache_dir, patient_ids, t_slice=slice(None), z_slice=slice(None)
     ):
@@ -129,7 +134,7 @@ class P2PCSE_Predict(Dataset):
 
 
 # %%
-class DCE_P2PCSE_KXKYZ(LightningDataModule):
+class DCE_P2PDeCo_KXKYZ(LightningDataModule):
     def __init__(
         self,
         data_dir: os.PathLike = "/data/anlab/RawData_MR/",
@@ -166,9 +171,8 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
             else (self.data_dir / p).parent.name
             for p in self.dat_file_path_list
         ]
-        print(self.patient_ids, len(self.patient_ids))
 
-        # self.kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        self.kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         # self.train_idx, self.val_idx = [
         #     (train, test) for train, test in self.kf.split(self.dat_file_path_list)
         # ][self.fold_idx]
@@ -336,21 +340,21 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
     def setup(self, init=False, stage: str = "fit"):
         if stage == "fit":
             dask.config.set(scheduler="synchronous")
-            self.train_ds = P2PCSE_TRAIN(
+            self.train_ds = P2PDeCo_TRAIN(
                 self.cache_dir,
                 self.patient_ids,
                 self.patch_size,
                 self.patch_sample_number,
             )
-        self.val_ds = P2PCSE_VAL(
+        self.val_ds = P2PDeCo_VAL(
             self.cache_dir, self.patient_ids[0:1], slice(0, 1), slice(30, 50)
         )
-        self.pred_ds = P2PCSE_Predict(
+        self.pred_ds = P2PDeCo_Predict(
             self.cache_dir,
             self.patient_ids,
         )
-        self.test_ds = P2PCSE_VAL(
-            self.cache_dir, self.patient_ids, slice(0, 1), slice(30, 50)
+        self.test_ds = P2PDeCo_VAL(
+            self.cache_dir, self.patient_ids, slice(0, 1), slice(30, 70)
         )
 
     def train_dataloader(self):
@@ -410,7 +414,7 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
 if __name__ == "__main__":
     # dataset = LibriSpeech()
     # dataset.prepare_data()
-    data = DCE_P2PCSE_KXKYZ()
+    data = DCE_P2PDeCo_KXKYZ()
     data.prepare_data()
     data.setup()
 

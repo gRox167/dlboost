@@ -5,19 +5,181 @@ from glob import glob
 from pathlib import Path
 
 import dask
+import dask.array as da
 import numpy as np
 import torch
 import xarray as xr
-import zarr
-
-# from dataclasses import dataclass
-from dlboost.datasets.boilerplate import recon_one_scan
+from dask.distributed import Client
+from icecream import ic
 
 # from einops import rearrange
 from lightning.pytorch import LightningDataModule
+from sklearn.model_selection import KFold
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
 
-# from mrboost import io_utils as iou
-from torch.utils.data import DataLoader
+from dlboost.datasets.boilerplate import collate_fn
+
+# from dataclasses import dataclass
+from dlboost.NODEO.Registration import registration
+from dlboost.utils.io_utils import async_save_xarray_dataset
+
+
+class MOTIF_CORD_TRAIN(Dataset):
+    def __init__(
+        self,
+        cache_dir,
+        train_patient_ids,
+        patch_size=(20, 320, 320),
+        patch_sample_number=5,
+    ):
+        self.cache_dir = cache_dir
+        self.train_patient_ids = train_patient_ids
+        self.patch_size = patch_size
+        self.patch_sample_number = patch_sample_number
+        self.train_kd = [
+            str(self.cache_dir / "train" / f"{pid}.zarr")
+            for pid in self.train_patient_ids
+        ]
+        self.train_p2p = [
+            xr.open_zarr(str(self.cache_dir / "train" / "P2PCSE" / f"{pid}.zarr"))
+            for pid in self.train_patient_ids
+        ]
+        self.train_mvf = [
+            xr.open_zarr(str(self.cache_dir / "train" / "MVF" / f"{pid}.zarr"))
+            for pid in self.train_patient_ids
+        ]
+        sample = self.train_p2p[0]
+        t_size = sample.sizes["t"]
+        t_indices = [i for i in range(t_size)] * self.patch_sample_number
+        # z axis have z slices, we want to randomly sample n patches from these slices, each patch have p slices.
+
+        z_indices = [
+            slice(start_idx, self.patch_size[0] + start_idx)
+            for start_idx in random.choices(
+                range(sample.sizes["z"] - self.patch_size[0]), k=len(t_indices)
+            )
+        ]
+        self.train_idx = [
+            (kd, p2p, mvf, t_idx, z_slice)
+            for kd, p2p, mvf in zip(self.train_kd, self.train_p2p, self.train_mvf)
+            for t_idx, z_slice in zip(t_indices, z_indices)
+        ]
+
+    def __len__(self):
+        return len(self.train_idx)
+
+    def __getitem__(self, index):
+        def get_data_dict(train_kd, train_p2p, train_mvf, t_idx, z_slice):
+            return {
+                "kspace_data_odd": xr.open_zarr(train_kd)["kspace_data_odd"].isel(
+                    t=t_idx, z=z_slice
+                ),
+                "kspace_data_even": xr.open_zarr(train_kd)["kspace_data_even"].isel(
+                    t=t_idx, z=z_slice
+                ),
+                "kspace_data_cse_odd": xr.open_zarr(train_kd)[
+                    "kspace_data_cse_odd"
+                ].isel(t=t_idx, z=z_slice),
+                "kspace_data_cse_even": xr.open_zarr(train_kd)[
+                    "kspace_data_cse_even"
+                ].isel(t=t_idx, z=z_slice),
+                "kspace_traj_odd": xr.open_zarr(train_kd)["kspace_traj_odd"].isel(
+                    t=t_idx
+                ),
+                "kspace_traj_even": xr.open_zarr(train_kd)["kspace_traj_even"].isel(
+                    t=t_idx
+                ),
+                "kspace_traj_cse_odd": xr.open_zarr(train_kd)[
+                    "kspace_traj_cse_odd"
+                ].isel(t=t_idx),
+                "kspace_traj_cse_even": xr.open_zarr(train_kd)[
+                    "kspace_traj_cse_even"
+                ].isel(t=t_idx),
+                "P2PCSE_odd": train_p2p["P2PCSE_odd"].isel(t=t_idx, z=z_slice),
+                "P2PCSE_even": train_p2p["P2PCSE_even"].isel(t=t_idx, z=z_slice),
+                "MVF_odd": train_mvf["MVF_odd"]
+                .isel(t=t_idx, z=z_slice)
+                .astype("float32"),
+                "MVF_even": train_mvf["MVF_even"]
+                .isel(t=t_idx, z=z_slice)
+                .astype("float32"),
+            }
+
+        return get_data_dict(*self.train_idx[index])
+
+
+class MOTIF_CORD_VAL(Dataset):
+    def __init__(
+        self, cache_dir, patient_ids, t_slice=slice(None), z_slice=slice(None)
+    ):
+        self.cache_dir = cache_dir
+        self.patient_ids = patient_ids
+        self.val_kd = [
+            xr.open_zarr(str(self.cache_dir / "train" / f"{pid}.zarr"))
+            for pid in self.patient_ids
+        ]
+        self.val_p2p = [
+            xr.open_zarr(str(self.cache_dir / "train" / "P2PCSE" / f"{pid}.zarr"))
+            for pid in self.patient_ids
+        ]
+        self.val_mvf = [
+            xr.open_zarr(str(self.cache_dir / "train" / "MVF" / f"{pid}.zarr"))
+            for pid in self.patient_ids
+        ]
+        self.t_slice = t_slice
+        self.z_slice = z_slice
+
+    def __len__(self):
+        return len(self.val_kd)
+
+    def __getitem__(self, index):
+        def get_data_dict(kd, p2p, mvf):
+            return {
+                "kspace_data_odd": kd["kspace_data_odd"].isel(
+                    t=self.t_slice, z=self.z_slice
+                ),
+                "kspace_data_cse_odd": kd["kspace_data_cse_odd"].isel(
+                    t=self.t_slice, z=self.z_slice
+                ),
+                "kspace_traj_odd": kd["kspace_traj_odd"].isel(t=self.t_slice),
+                "kspace_traj_cse_odd": kd["kspace_traj_cse_odd"].isel(t=self.t_slice),
+                "P2PCSE_odd": p2p["P2PCSE_odd"].isel(t=self.t_slice, z=self.z_slice),
+                "MVF_odd": mvf["MVF_odd"]
+                .isel(t=self.t_slice, z=self.z_slice)
+                .astype("float32"),
+                "path": Path(kd.encoding["source"]),
+                "id": kd.attrs["id"],
+            }
+
+        return get_data_dict(
+            self.val_kd[index], self.val_p2p[index], self.val_mvf[index]
+        )
+
+
+def registration_for_one_contrast(images):
+    device = torch.device("cuda:0")
+    moving = torch.from_numpy(images[:, 0:1].to_numpy()).abs().float().to(device)
+    scale_factor = (1.0, 0.5, 0.5)
+    moving = F.interpolate(
+        moving, scale_factor=scale_factor, mode="trilinear", align_corners=True
+    )
+    df_list = []
+    for ph in range(1, 5):
+        fixed = (
+            torch.from_numpy(images[:, ph : ph + 1].to_numpy()).abs().float().to(device)
+        )
+        fixed = F.interpolate(
+            fixed, scale_factor=scale_factor, mode="trilinear", align_corners=True
+        )
+        df, df_with_grid, warped_moving = registration(
+            device,
+            moving,
+            fixed,
+        )
+        df_list.append(df)
+    df_one_contrast = torch.cat(df_list)
+    return df_one_contrast
 
 
 # %%
@@ -37,6 +199,7 @@ class DCE_MOTIF_KXKYZ(LightningDataModule):
         num_workers: int = 0,
     ):
         super().__init__()
+        super().__init__()
         # self.train_scope = slice(*train_scope)
         # self.val_scope = slice(*val_scope)
         # self.load_scope = slice(*load_scope)
@@ -49,253 +212,177 @@ class DCE_MOTIF_KXKYZ(LightningDataModule):
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir) / ".DCE_MOTIF_CORD"
         self.num_workers = num_workers
-        self.rand_idx = rand_idx
-        self.n_splits = n_splits
-        print(fold_idx)
         self.fold_idx = fold_idx
-
+        self.ref_phase = 0
         self.dat_file_path_list = dat_file_path_list
+
         self.patient_ids = [
-            (self.data_dir / p).parent.name for p in self.dat_file_path_list
+            (self.data_dir / p).parent.name + "_DB"
+            if "_Dyn_DB.dat" in p
+            else (self.data_dir / p).parent.name
+            for p in self.dat_file_path_list
         ]
 
-        # self.kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        # self.train_idx, self.val_idx = [
-        #     (train, test) for train, test in self.kf.split(self.dat_file_path_list)
-        # ][self.fold_idx]
+        self.kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
         print("rand_idx: ", rand_idx)
         splits = np.array_split(rand_idx, n_splits)
         print("splits: ", splits)
-        self.val_idx = splits.pop(fold_idx)
-        self.train_idx = np.concatenate(splits)
-        self.train_patient_ids = [self.patient_ids[i] for i in self.train_idx]
-        self.val_patient_ids = [self.patient_ids[i] for i in self.val_idx]
-        print("validation patient ids: ", [self.patient_ids[i] for i in self.val_idx])
-        print("training patient ids: ", [self.patient_ids[i] for i in self.train_idx])
+        # self.val_idx = splits.pop(fold_idx)
+        # self.train_idx = np.concatenate(splits)
+        # self.train_patient_ids = [self.patient_ids[i] for i in self.train_idx]
+        # self.val_patient_ids = [self.patient_ids[i] for i in self.val_idx]
+        # print("validation patient ids: ", [self.patient_ids[i] for i in self.val_idx])
+        # print("training patient ids: ", [self.patient_ids[i] for i in self.train_idx])
+        # for testing
+        self.train_patient_ids = self.patient_ids
+        self.val_patient_ids = self.patient_ids
+        ic(self.patient_ids)
+        self.client = None
+        self.futures = []
 
     def prepare_data(self):
         # self.train_save_path = self.cache_dir / str(self.fold_idx) / "train"
-        return
-        self.train_save_path = self.cache_dir / "train"
+        # return
+        self.train_save_path = self.cache_dir / "train" / "MVF"
         train_integrate = False
         if os.path.exists(self.train_save_path):
             if len(glob(str(self.train_save_path / "*.zarr"))) == len(
-                self.train_idx
-            ) + len(self.val_idx):
+                self.train_patient_ids
+            ) + len(self.val_patient_ids):
                 train_integrate = True
         if not train_integrate:
             self.generate_train_dataset(self.train_save_path)
 
-        # self.val_save_path = self.cache_dir / str(self.fold_idx) / "val"
-        self.val_save_path = self.cache_dir / "val"
-        val_integrate = False
-        if os.path.exists(self.val_save_path):
-            if len(glob(str(self.val_save_path / "*.zarr"))) == len(
-                self.train_idx
-            ) + len(self.val_idx):
-                val_integrate = True
-        if not val_integrate:
-            self.generate_val_dataset(self.val_save_path)
+        # self.val_save_path = self.cache_dir / "val" / "MVF"
+        # val_integrate = False
+        # if os.path.exists(self.val_save_path):
+        #     if len(glob(str(self.val_save_path / "*.zarr"))) == len(
+        #         self.train_patient_ids
+        #     ) + len(self.val_patient_ids):
+        #         val_integrate = True
+        # if not val_integrate:
+        #     self.generate_val_dataset(self.val_save_path)
+
+        for patient_id, i, future in self.futures:
+            future.result()
+            ic(patient_id, "contrast:", i, "is written")
 
     def generate_val_dataset(self, val_save_path):
         for p, patient_id in zip(self.dat_file_path_list, self.patient_ids):
-            dat_file_to_recon = Path(self.data_dir) / p
-            if os.path.exists(val_save_path / (patient_id + ".zarr")):
+            # dat_file_to_recon = Path(self.data_dir) / p
+            save_path = val_save_path / (patient_id + ".zarr")
+            if os.path.exists(save_path):
                 continue
-            raw_data = recon_one_scan(
-                dat_file_to_recon, phase_num=5, time_per_contrast=10
+            p2p = xr.open_zarr(val_save_path.parent / "P2PCSE" / (patient_id + ".zarr"))
+
+            result_ds = xr.Dataset(
+                {
+                    "MVF": xr.DataArray(
+                        da.zeros(
+                            (34, 4, 3, 80, 160, 160), chunks=(1, 4, 3, 1, 160, 160)
+                        ),
+                        dims=["t", "target_ph", "dim", "z", "h", "w"],
+                    ),
+                }
             )
-            if os.path.exists(val_save_path / (patient_id + ".zarr")):
-                continue
-            ds = xr.Dataset(
-                data_vars=dict(
-                    kspace_data=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
-                        raw_data["kspace_data_z"].numpy(),
-                    ),
-                    kspace_data_compensated=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
-                        raw_data["kspace_data_z_compensated"].numpy(),
-                    ),
-                    kspace_data_cse=xr.Variable(
-                        ["t", "ph2", "ch", "z", "sp2", "lens2"],
-                        raw_data["kspace_data_z"][..., 240:400].numpy(),
-                    ),
-                    kspace_traj=xr.Variable(
-                        ["t", "ph", "complex", "sp", "lens"],
-                        raw_data["kspace_traj"].numpy(),
-                    ),
-                    kspace_traj_cse=xr.Variable(
-                        ["t", "ph2", "complex", "sp2", "lens2"],
-                        raw_data["kspace_traj"][..., 240:400].numpy(),
-                    ),
-                    cse=xr.Variable(["ch", "z", "h", "w"], raw_data["cse"].numpy()),
-                ),
-                attrs={"id": patient_id},
-            )
-            ds = (
-                ds.stack({"k": ["sp", "lens"]})
-                .stack({"k2": ["ph2", "sp2", "lens2"]})
-                .chunk(
+
+            result_ds.to_zarr(save_path, compute=False)
+            for i in range(p2p.sizes["t"]):
+                df = registration_for_one_contrast(
+                    p2p["P2PCSE"].isel({"t": slice(i, i + 1)})
+                )
+                output_ds = xr.Dataset(
                     {
-                        "t": 1,
-                        "ph": -1,
-                        "ch": -1,
-                        "z": 1,
-                        "k": -1,
-                        "k2": -1,
-                        "complex": -1,
-                        "h": -1,
-                        "w": -1,
+                        "MVF": (
+                            ("t", "target_ph", "dim", "z", "h", "w"),
+                            df.unsqueeze(0).numpy(force=True),
+                        ),
                     }
                 )
-            )
-            ds = ds.reset_index(list(ds.indexes))
-            ds.to_zarr(val_save_path / (patient_id + ".zarr"))
+                future = async_save_xarray_dataset(
+                    output_ds,
+                    save_path,
+                    self.client,
+                    mode="a",
+                    region={"t": slice(i, i + 1)},
+                )
+                self.futures.append((patient_id, i, future))
 
     def generate_train_dataset(self, train_save_path):
-        # iou.check_mk_dirs(self.cache_dir / str(self.fold_idx))
         for p, patient_id in zip(self.dat_file_path_list, self.patient_ids):
-            dat_file_to_recon = Path(self.data_dir) / p
-            if os.path.exists(train_save_path / (patient_id + ".zarr")):
+            save_path = train_save_path / (patient_id + ".zarr")
+            if os.path.exists(save_path):
                 continue
-            raw_data = recon_one_scan(
-                dat_file_to_recon, phase_num=10, time_per_contrast=20
+            if self.client is None:
+                self.client = Client()
+            p2p = xr.open_zarr(
+                train_save_path.parent / "P2PCSE" / (patient_id + ".zarr")
             )
-            ds = xr.Dataset(
-                data_vars=dict(
-                    kspace_data_odd=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
-                        raw_data["kspace_data_z"][:, 0::2].numpy(),
+
+            result_ds = xr.Dataset(
+                {
+                    "MVF_odd": xr.DataArray(
+                        da.zeros(
+                            (17, 4, 3, 80, 160, 160), chunks=(1, 4, 3, 1, 160, 160)
+                        ),
+                        dims=["t", "target_ph", "dim", "z", "h", "w"],
                     ),
-                    kspace_data_even=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
-                        raw_data["kspace_data_z"][:, 1::2].numpy(),
+                    "MVF_even": xr.DataArray(
+                        da.zeros(
+                            (17, 4, 3, 80, 160, 160), chunks=(1, 4, 3, 1, 160, 160)
+                        ),
+                        dims=["t", "target_ph", "dim", "z", "h", "w"],
                     ),
-                    kspace_data_compensated_odd=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
-                        raw_data["kspace_data_z_compensated"][:, 0::2].numpy(),
-                    ),
-                    kspace_data_compensated_even=xr.Variable(
-                        ["t", "ph", "ch", "z", "sp", "lens"],
-                        raw_data["kspace_data_z_compensated"][:, 1::2].numpy(),
-                    ),
-                    kspace_data_cse_odd=xr.Variable(
-                        ["t", "ph2", "ch", "z", "sp2", "lens2"],
-                        raw_data["kspace_data_z"][:, 0::2, ..., 240:400].numpy(),
-                    ),
-                    kspace_data_cse_even=xr.Variable(
-                        ["t", "ph2", "ch", "z", "sp2", "lens2"],
-                        raw_data["kspace_data_z"][:, 1::2, ..., 240:400].numpy(),
-                    ),
-                    kspace_traj_odd=xr.Variable(
-                        ["t", "ph", "complex", "sp", "lens"],
-                        raw_data["kspace_traj"][:, 0::2].numpy(),
-                    ),
-                    kspace_traj_even=xr.Variable(
-                        ["t", "ph", "complex", "sp", "lens"],
-                        raw_data["kspace_traj"][:, 1::2].numpy(),
-                    ),
-                    kspace_traj_cse_odd=xr.Variable(
-                        ["t", "ph2", "complex", "sp2", "lens2"],
-                        raw_data["kspace_traj"][:, 0::2, ..., 240:400].numpy(),
-                    ),
-                    kspace_traj_cse_even=xr.Variable(
-                        ["t", "ph2", "complex", "sp2", "lens2"],
-                        raw_data["kspace_traj"][:, 1::2, ..., 240:400].numpy(),
-                    ),
-                    cse=xr.Variable(["ch", "z", "h", "w"], raw_data["cse"].numpy()),
-                ),
-                attrs={"id": patient_id},
+                }
             )
-            ds = (
-                ds.stack({"k": ["sp", "lens"]})
-                .stack({"k2": ["ph2", "sp2", "lens2"]})
-                .chunk(
+
+            result_ds.to_zarr(save_path, compute=False)
+            for i in range(p2p.sizes["t"]):
+                df_odd = registration_for_one_contrast(
+                    p2p["P2PCSE_odd"].isel({"t": slice(i, i + 1)})
+                )
+                df_even = registration_for_one_contrast(
+                    p2p["P2PCSE_even"].isel({"t": slice(i, i + 1)})
+                )
+                output_ds = xr.Dataset(
                     {
-                        "t": 1,
-                        "ph": -1,
-                        "ch": -1,
-                        "z": 1,
-                        "k": -1,
-                        "k2": -1,
-                        "complex": -1,
-                        "h": -1,
-                        "w": -1,
+                        "MVF_odd": (
+                            ("t", "target_ph", "dim", "z", "h", "w"),
+                            df_odd.unsqueeze(0).numpy(force=True),
+                        ),
+                        "MVF_even": (
+                            ("t", "target_ph", "dim", "z", "h", "w"),
+                            df_even.unsqueeze(0).numpy(force=True),
+                        ),
                     }
                 )
-            )
-            ds = ds.reset_index(list(ds.indexes))
-            ds.to_zarr(train_save_path / (patient_id + ".zarr"))
+                future = async_save_xarray_dataset(
+                    output_ds,
+                    save_path,
+                    self.client,
+                    mode="a",
+                    region={"t": slice(i, i + 1)},
+                )
+                self.futures.append((patient_id, i, future))
+                ic(patient_id, "contrast:", i, "is writting")
 
     def setup(self, init=False, stage: str = "fit"):
-        dask.config.set(scheduler="synchronous")
-        train_ds_list = [
-            str(self.cache_dir / "train" / f"{pid}.zarr")
-            for pid in self.train_patient_ids
-        ]
         if stage == "fit":
-            # str(self.cache_dir / str(self.fold_idx) / "train" / "*.zarr")
-            sample = xr.open_zarr(train_ds_list[0])
-            t = sample.sizes["t"]
-            z = sample.sizes["z"]
-            t_indices = [i for i in range(t)]
-            # z axis have z slices, we want to randomly sample n patches from these slices, each patch have p slices.
-            z_indices = [
-                slice(start_idx, self.patch_size[0] + start_idx)
-                for start_idx in random.sample(
-                    range(z - self.patch_size[0]), self.patch_sample_number
-                )
-            ]
-            self.train_dp = [
-                xr.open_zarr(train_ds).isel(t=t_idx, z=z_idx)
-                # xr.open_zarr(train_ds).isel(t=t_idx)
-                for train_ds in train_ds_list
-                for t_idx in t_indices
-                for z_idx in z_indices
-            ]
-        else:
-            self.train_dp = [xr.open_zarr(ds) for ds in train_ds_list]
-
-        val_ds_list = [
-            (
-                str(self.cache_dir / "val" / f"{pid}.zarr"),
-                str((self.cache_dir / "val" / f"{pid}_P2PCSE.zarr")),
+            dask.config.set(scheduler="synchronous")
+            self.train_ds = MOTIF_CORD_TRAIN(
+                self.cache_dir,
+                self.train_patient_ids,
+                self.patch_size,
+                self.patch_sample_number,
             )
-            for pid in self.patient_ids[2:3]
-        ]
-        self.val_dp = [
-            (
-                xr.open_zarr(ds).isel(t=slice(0, 1), z=slice(36, 44)),
-                xr.open_zarr(init).isel(t=slice(0, 1), z=slice(36, 44)),
-            )
-            for ds, init in val_ds_list
-        ]
-        # self.pred_dp = [xr.open_zarr(ds) for ds in val_ds_list]
+        self.val_ds = MOTIF_CORD_VAL(
+            self.cache_dir, self.val_patient_ids[0:1], slice(0, 1), slice(30, 50)
+        )
 
     def train_dataloader(self):
-        train_keys = [
-            "kspace_data_odd",
-            "kspace_data_even",
-            "kspace_data_cse_odd",
-            "kspace_data_cse_even",
-            "kspace_traj_odd",
-            "kspace_traj_even",
-            "kspace_traj_cse_odd",
-            "kspace_traj_cse_even",
-            "P2PCSE_odd",
-            "P2PCSE_even",
-        ]
-
-        def collate_fn(batch_list):
-            batch = {k: [] for k in train_keys}
-            for x in batch_list:
-                for k in train_keys:
-                    batch[k].append(torch.from_numpy(x[k].to_numpy()))
-            return {k: torch.stack(v) for k, v in batch.items()}
-
         return DataLoader(
-            self.train_dp,
+            self.train_ds,
             batch_size=self.train_batch_size,
             num_workers=self.num_workers,
             shuffle=True,
@@ -304,35 +391,15 @@ class DCE_MOTIF_KXKYZ(LightningDataModule):
         )
 
     def val_dataloader(self):
-        val_keys = [
-            "kspace_data",
-            "kspace_data_cse",
-            "kspace_traj",
-            "kspace_traj_cse",
-            "P2PCSE",
-        ]
-
-        def collate_fn(batch_list):
-            return_list = []
-            for kd, init in batch_list:
-                batch = {k: None for k in val_keys}
-                for k in val_keys:
-                    if k == "P2PCSE":
-                        batch[k] = torch.from_numpy(init[k].to_numpy())
-                    else:
-                        batch[k] = torch.from_numpy(kd[k].to_numpy())
-                return_list.append(batch)
-            return return_list
-
         return DataLoader(
-            self.val_dp,
+            self.val_ds,
             batch_size=self.val_batch_size,
             num_workers=0,
-            pin_memory=False,
-            collate_fn=collate_fn,
+            pin_memory=True,
+            collate_fn=lambda x: x,
         )
 
-    def predict_dataloader(self):
+    def predict_dataloader(self):  # -> DataLoader:
         return DataLoader(
             self.val_dp,
             batch_size=self.val_batch_size,
@@ -356,13 +423,13 @@ class DCE_MOTIF_KXKYZ(LightningDataModule):
             ],
         )
 
-    def transfer_batch_to_device(
-        self, batch, device: torch.device, dataloader_idx: int
-    ):
-        if self.trainer.training:
-            return super().transfer_batch_to_device(batch, device, dataloader_idx)
-        else:
-            return batch
+    # def transfer_batch_to_device(
+    #     self, batch, device: torch.device, dataloader_idx: int
+    # ):
+    #     if self.trainer.training:
+    #         return super().transfer_batch_to_device(batch, device, dataloader_idx)
+    #     else:
+    #         return batch
 
 
 # %%

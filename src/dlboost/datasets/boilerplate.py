@@ -1,19 +1,19 @@
 from os import PathLike
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence
-import lightning.pytorch as pl
-import nibabel as nib
+from typing import Literal
+
+import monai
 import torch
-import xarray as xr
-from mrboost import reconstruction as recon
-from mrboost import computation as comp
 
 # from monai.data.image_reader import ImageReader
 import zarr
 from einops import rearrange  # , reduce, repeat
-from torch.utils.data import Dataset
-import monai
 from lightning.pytorch.callbacks import BasePredictionWriter
+from optree import tree_structure, tree_transpose
+from torch.utils.data import Dataset
+
+from mrboost import computation as comp
+from mrboost import reconstruction as recon
 
 
 def recon_one_scan(dat_file_to_recon, phase_num=5, time_per_contrast=10):
@@ -79,6 +79,17 @@ def recon_one_scan_BlackBone(
     ]
     return_data["kspace_traj"] = kspace_traj
     return_data["cse"] = cse
+
+
+def collate_fn(batch):
+    # transpose dict structure out of list
+    batch_transposed = tree_transpose(
+        tree_structure([0 for _ in batch]), tree_structure(batch[0]), batch
+    )
+    return {
+        k: torch.stack([torch.from_numpy(b.to_numpy()) for b in v])
+        for k, v in batch_transposed.items()
+    }
 
 
 def check_top_k_channel(d, k=5):

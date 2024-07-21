@@ -18,7 +18,6 @@ from dlboost.NODEO.Network import BrainNet
 from dlboost.NODEO.NeuralODE import NeuralODE
 from dlboost.NODEO.Utils import (
     SpatialTransformer,
-    ResizeTransform,
     dice,
     generate_grid3D_tensor,
     load_nii,
@@ -104,7 +103,7 @@ def registration_main(config, device, moving, fixed):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        if (i + 1) % 20 == 0:
+        if (i + 1) % 20 == 0 and verbose:
             print(
                 "Iteration: {0} Loss_sim: {1:.3e} loss_J: {2:.3e}".format(
                     i + 1, loss_sim.item(), loss_J.item()
@@ -120,7 +119,7 @@ def registration_main(config, device, moving, fixed):
     return best_df, best_df_with_grid, best_warped_moving
 
 
-def registration(device, moving, fixed):
+def registration(device, moving, fixed, verbose=False):
     """
     Registration moving to fixed.
     :param config: configurations.
@@ -131,7 +130,7 @@ def registration(device, moving, fixed):
     :return all_phi: Displacement field for all time steps.
     """
     # make batch dimension
-    im_shape = fixed.shape
+    im_shape = fixed.shape[-3:]
 
     Network = BrainNet(
         img_sz=im_shape,
@@ -163,7 +162,6 @@ def registration(device, moving, fixed):
         warped_moving, df_with_grid = ST(moving, df, return_phi=True)
         # similarity loss
         loss_sim = loss_NCC(warped_moving, fixed)
-        warped_moving = warped_moving.squeeze(0).squeeze(0)
         # V magnitude loss
         loss_v = 0.00005 * magnitude_loss(all_v)
         # neg Jacobian loss
@@ -174,7 +172,7 @@ def registration(device, moving, fixed):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        if (i + 1) % 20 == 0:
+        if (i + 1) % 20 == 0 and verbose:
             print(
                 "Iteration: {0} Loss_sim: {1:.3e} loss_J: {2:.3e}".format(
                     i + 1, loss_sim.item(), loss_J.item()
@@ -187,7 +185,7 @@ def registration(device, moving, fixed):
                 best_df = df.detach().clone()
                 best_df_with_grid = df_with_grid.detach().clone()
                 best_warped_moving = warped_moving.detach().clone()
-    
+
     return best_df, best_df_with_grid, best_warped_moving
 
 

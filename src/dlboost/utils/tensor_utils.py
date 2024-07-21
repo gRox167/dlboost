@@ -8,16 +8,12 @@ from typing import (
 
 import einops as eo
 import torch
-from icecream import ic
 from jaxtyping import PyTree
 from optree import tree_map
 from plum import dispatch, overload
 from torch import Tensor
 from torch.nn import functional as f
 from xarray import DataArray
-
-
-
 
 
 def complex_as_real_2ch(x):
@@ -196,14 +192,14 @@ def for_vmap(func, in_dims=0, out_dims=0, batch_size: Union[int, None] = None):
 def interpolate(img, scale_factor, mode, align_corners=True):
     if not torch.is_complex(img):
         return f.interpolate(
-            img, scale_factor=scale_factor, mode=mode, align_corners=True
+            img, scale_factor=scale_factor, mode=mode, align_corners=align_corners
         )
     else:
         r = f.interpolate(
-            img.real, scale_factor=scale_factor, mode=mode, align_corners=True
+            img.real, scale_factor=scale_factor, mode=mode, align_corners=align_corners
         )
         i = f.interpolate(
-            img.imag, scale_factor=scale_factor, mode=mode, align_corners=True
+            img.imag, scale_factor=scale_factor, mode=mode, align_corners=align_corners
         )
         return torch.complex(r, i)
 
