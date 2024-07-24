@@ -343,11 +343,10 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
                 self.patch_sample_number,
             )
         self.val_ds = P2PCSE_VAL(
-            self.cache_dir, self.patient_ids[0:1], slice(0, 1), slice(30, 50)
+            self.cache_dir, self.patient_ids[0:1], slice(0, 4), slice(32, 33)
         )
         self.pred_ds = P2PCSE_Predict(
-            self.cache_dir,
-            self.patient_ids,
+            self.cache_dir, self.patient_ids, slice(0, 3), slice(30, 50)
         )
         self.test_ds = P2PCSE_VAL(
             self.cache_dir, self.patient_ids, slice(0, 1), slice(30, 50)
@@ -400,7 +399,8 @@ class DCE_P2PCSE_KXKYZ(LightningDataModule):
     def transfer_batch_to_device(
         self, batch, device: torch.device, dataloader_idx: int
     ):
-        if self.trainer.training:
+        print(self.trainer.state)
+        if self.trainer.state == "fit":
             return super().transfer_batch_to_device(batch, device, dataloader_idx)
         else:
             return batch

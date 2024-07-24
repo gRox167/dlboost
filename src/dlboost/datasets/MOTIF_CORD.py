@@ -377,7 +377,11 @@ class DCE_MOTIF_KXKYZ(LightningDataModule):
                 self.patch_sample_number,
             )
         self.val_ds = MOTIF_CORD_VAL(
-            self.cache_dir, self.val_patient_ids[0:1], slice(0, 1), slice(30, 50)
+            # self.cache_dir, self.val_patient_ids[16:17], slice(0, 17), slice(0, 80)
+            self.cache_dir,
+            self.val_patient_ids[7:8],
+            slice(0, 17),
+            slice(0, 80),
         )
 
     def train_dataloader(self):
