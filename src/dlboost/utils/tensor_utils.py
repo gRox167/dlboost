@@ -19,7 +19,9 @@ from xarray import DataArray
 def complex_as_real_2ch(x):
     # breakpoint()
     if len(x.shape) == 4:
-        return eo.rearrange(torch.view_as_real(x), "b c h w cmplx-> b (c cmplx) h w")
+        return eo.rearrange(
+            torch.view_as_real(x), "b c h w cmplx-> b (c cmplx) h w"
+        )
     elif len(x.shape) == 5:
         return eo.rearrange(
             torch.view_as_real(x), "b c d h w cmplx-> b (c cmplx) d h w"
@@ -78,6 +80,54 @@ def normalize(x, return_mean_std=False):
 
 def renormalize(x, mean, std):
     return x * std + mean
+
+
+def percentile(t: torch.tensor, l, h):
+    """
+    Return the ``q``-th percentile of the flattened input tensor's data.
+
+    CAUTION:
+     * Needs PyTorch >= 1.1.0, as ``torch.kthvalue()`` is used.
+     * Values are not interpolated, which corresponds to
+       ``numpy.percentile(..., interpolation="nearest")``.
+
+    :param t: Input tensor.
+    :param q: Percentile to compute, which must be between 0 and 100 inclusive.
+    :return: Resulting value (scalar).
+    """
+    # Note that ``kthvalue()`` works one-based, i.e. the first sorted value
+    # indeed corresponds to k=1, not k=0! Use float(q) instead of q directly,
+    # so that ``round()`` returns an integer, even if q is a np.float32.
+    l_ = 1 + round(0.01 * float(l) * (t.numel() - 1))
+    h_ = 1 + round(0.01 * float(h) * (t.numel() - 1))
+    l_th = t.kthvalue(l_).values
+    h_th = t.kthvalue(h_).values
+    return l_th, h_th
+
+
+def complex_normalize_abs_95(x, start_dim=0, expand=True):
+    """
+    Normalize the input complex tensor by clamping its absolute values
+    between the 2.5th and 97.5th percentiles, then standardizing it.
+
+    Args:
+        x (torch.Tensor): Input complex tensor.
+        start_dim (int, optional): The dimension to start flattening. Defaults to 0.
+        expand (bool, optional): Whether to expand the mean and std to match the shape of x. Defaults to True.
+
+    Returns:
+        tuple: A tuple containing the normalized tensor, mean, and std.
+    """
+    x_abs = x.abs()
+    min_95, max_95 = percentile(x_abs.flatten(start_dim), 2.5, 97.5)
+    x_abs_clamped = torch.clamp(x_abs, min_95, max_95)
+    mean = torch.mean(x_abs_clamped)
+    std = torch.std(x_abs_clamped, unbiased=False)
+    return (
+        # (x - mean) / std,
+        mean.expand_as(x_abs_clamped) if expand else mean,
+        std.expand_as(x_abs_clamped) if expand else std,
+    )
 
 
 def formap(func, in_dims=0, out_dims=0, batch_size=1):
@@ -192,14 +242,23 @@ def for_vmap(func, in_dims=0, out_dims=0, batch_size: Union[int, None] = None):
 def interpolate(img, scale_factor, mode, align_corners=True):
     if not torch.is_complex(img):
         return f.interpolate(
-            img, scale_factor=scale_factor, mode=mode, align_corners=align_corners
+            img,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=align_corners,
         )
     else:
         r = f.interpolate(
-            img.real, scale_factor=scale_factor, mode=mode, align_corners=align_corners
+            img.real,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=align_corners,
         )
         i = f.interpolate(
-            img.imag, scale_factor=scale_factor, mode=mode, align_corners=align_corners
+            img.imag,
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=align_corners,
         )
         return torch.complex(r, i)
 

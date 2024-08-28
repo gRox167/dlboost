@@ -3,11 +3,11 @@ __all__ = ["ComplexUnet", "ComplexUnetDenoiser", "ComplexUnet_norm"]
 
 from collections.abc import Sequence
 
-import torch.nn as nn
+import einx
 import torch
-from torch import Tensor, vmap
-# from einops import rearrange,repeat, reduce
+import torch.nn as nn
 
+# from einops import rearrange,repeat, reduce
 from monai.apps.reconstruction.networks.nets.utils import (
     complex_normalize,
     divisible_pad_t,
@@ -16,64 +16,44 @@ from monai.apps.reconstruction.networks.nets.utils import (
     reshape_complex_to_channel_dim,
 )
 from monai.networks.nets.basic_unet import BasicUNet
+from torch import Tensor, vmap
 
-def percentile(t: torch.tensor, l, h):
-    """
-    Return the ``q``-th percentile of the flattened input tensor's data.
-    
-    CAUTION:
-     * Needs PyTorch >= 1.1.0, as ``torch.kthvalue()`` is used.
-     * Values are not interpolated, which corresponds to
-       ``numpy.percentile(..., interpolation="nearest")``.
-       
-    :param t: Input tensor.
-    :param q: Percentile to compute, which must be between 0 and 100 inclusive.
-    :return: Resulting value (scalar).
-    """
-    # Note that ``kthvalue()`` works one-based, i.e. the first sorted value
-    # indeed corresponds to k=1, not k=0! Use float(q) instead of q directly,
-    # so that ``round()`` returns an integer, even if q is a np.float32.
-    l_ = 1 + round(.01 * float(l) * (t.numel() - 1))
-    h_ = 1 + round(.01 * float(h) * (t.numel() - 1))
-    l_th = t.kthvalue(l_).values
-    h_th = t.kthvalue(h_).values
-    return l_th, h_th
+from dlboost.utils.tensor_utils import complex_normalize_abs_95
 
-# percentile_v = vmap(percentile, in_dims=(0, None, None), out_dims=0)
-# clamp_v = vmap(torch.clamp, in_dims=(0, 0, 0), out_dims=0)
-def complex_normalize_abs_95(x, start_dim = 0):
-    x_abs = x.abs()  
-    min_95, max_95 = percentile(x_abs.flatten(start_dim), 2.5, 97.5)
-    x_abs_clamped = torch.clamp(x_abs, min_95, max_95)
-    # x_abs_clamped = x_abs.clamp(min=min_95, max=max_95)
-    mean = torch.mean(x_abs_clamped)
-    std = torch.std(x_abs_clamped, unbiased=False)
-    return (x - mean) / std, mean.expand_as(x_abs_clamped), std.expand_as(x_abs_clamped)
-complex_normalize_abs_95_v = vmap(complex_normalize_abs_95, in_dims= 0, out_dims=( 0,0,0 ))
+complex_normalize_abs_95_v = vmap(
+    complex_normalize_abs_95, in_dims=0, out_dims=(0, 0, 0)
+)
+
 
 class ComplexUnet(nn.Module):
     def __init__(
         self,
-        in_channels:int = 3, 
-        out_channels:int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
         spatial_dims: int = 2,
         features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        act: str | tuple = (
+            "LeakyReLU",
+            {"negative_slope": 0.1, "inplace": True},
+        ),
         norm: str | tuple = ("instance", {"affine": True}),
         bias: bool = True,
         dropout: float | tuple = 0.0,
         upsample: str = "nontrainable",
         pad_factor: int = 16,
         conv_net: nn.Module | None = None,
+        input_append_channel=0,
+        norm_with_given_std=False,
     ):
         super().__init__()
         self.unet: nn.Module
         self.in_channels = in_channels
+        self.input_append_channel = input_append_channel
         if conv_net is None:
             self.unet = BasicUNet(
                 spatial_dims=spatial_dims,
-                in_channels=2*in_channels,
-                out_channels=2*out_channels,
+                in_channels=2 * in_channels + self.input_append_channel,
+                out_channels=2 * out_channels,
                 features=features,
                 act=act,
                 norm=norm,
@@ -88,10 +68,15 @@ class ComplexUnet(nn.Module):
             # if params[0][1] != 2:
             #     raise ValueError(f"in_channels should be 2 but it's {params[0][1]}.")
             self.unet = conv_net
-
+        self.norm_with_given_std = norm_with_given_std
         self.pad_factor = pad_factor
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        input_append_channel: Tensor | None = None,
+        std: Tensor | float = None,
+    ) -> Tensor:
         """
         Args:
             x: input of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
@@ -101,27 +86,45 @@ class ComplexUnet(nn.Module):
         """
         # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
         # print(x.shape)
-        x, mean, std = complex_normalize_abs_95_v(x)  # x will be of shape (B,C*2,H,W)
+        if self.norm_with_given_std:
+            x = x / std
+        else:
+            mean, std = complex_normalize_abs_95_v(
+                x
+            )  # x will be of shape (B,C*2,H,W)
+            x = x / std
 
         x = torch.view_as_real(x)
 
         x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
-        # x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
+        if input_append_channel is not None:
+            x = einx.rearrange(
+                "b c1 ..., b c2 ... -> b (c1+c2) ...", x, input_append_channel
+            )
         x = self.unet(x)
-        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
+        x = reshape_channel_complex_to_last_dim(
+            x
+        )  # x will be of shape (B,C,H,W,2)
         x = torch.view_as_complex(x.contiguous())
-        x = x * std + mean
+        if self.norm_with_given_std:
+            x = x * std
+        else:
+            x = x * std
+            # x = x * std + mean
         return x
 
-    
+
 class ComplexUnet_norm(nn.Module):
     def __init__(
         self,
-        in_channels:int = 3, 
-        out_channels:int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
         spatial_dims: int = 2,
         features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        act: str | tuple = (
+            "LeakyReLU",
+            {"negative_slope": 0.1, "inplace": True},
+        ),
         norm: str | tuple = ("instance", {"affine": True}),
         bias: bool = True,
         dropout: float | tuple = 0.0,
@@ -135,8 +138,8 @@ class ComplexUnet_norm(nn.Module):
         if conv_net is None:
             self.unet = BasicUNet(
                 spatial_dims=spatial_dims,
-                in_channels=2*in_channels,
-                out_channels=2*out_channels,
+                in_channels=2 * in_channels,
+                out_channels=2 * out_channels,
                 features=features,
                 act=act,
                 norm=norm,
@@ -164,7 +167,9 @@ class ComplexUnet_norm(nn.Module):
         """
         # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
         # print(x.shape)
-        x, mean, std = complex_normalize_abs_95_v(x)  # x will be of shape (B,C*2,H,W)
+        x, mean, std = complex_normalize_abs_95_v(
+            x
+        )  # x will be of shape (B,C*2,H,W)
 
         x = torch.view_as_real(x)
 
@@ -172,7 +177,9 @@ class ComplexUnet_norm(nn.Module):
         # x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
 
         x = self.unet(x)
-        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
+        x = reshape_channel_complex_to_last_dim(
+            x
+        )  # x will be of shape (B,C,H,W,2)
         x = torch.view_as_complex(x.contiguous())
         x = x * std + mean
         return x
@@ -181,11 +188,14 @@ class ComplexUnet_norm(nn.Module):
 class ComplexUnetDenoiser(nn.Module):
     def __init__(
         self,
-        in_channels:int = 3, 
-        out_channels:int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
         spatial_dims: int = 2,
         features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        act: str | tuple = (
+            "LeakyReLU",
+            {"negative_slope": 0.1, "inplace": True},
+        ),
         norm: str | tuple = ("instance", {"affine": True}),
         bias: bool = True,
         dropout: float | tuple = 0.0,
@@ -198,8 +208,8 @@ class ComplexUnetDenoiser(nn.Module):
         if conv_net is None:
             self.unet = BasicUNet(
                 spatial_dims=spatial_dims,
-                in_channels=2*in_channels,
-                out_channels=2*out_channels,
+                in_channels=2 * in_channels,
+                out_channels=2 * out_channels,
                 features=features,
                 act=act,
                 norm=norm,
@@ -216,7 +226,6 @@ class ComplexUnetDenoiser(nn.Module):
             self.unet = conv_net
 
         self.pad_factor = pad_factor
-
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -239,9 +248,12 @@ class ComplexUnetDenoiser(nn.Module):
         x_ = self.unet(x)
         x_ -= identity
         # inverse padding
-        x_ = inverse_divisible_pad_t(x_, padding_sizes)  # x will be of shape (B,C*2,H,W)
+        x_ = inverse_divisible_pad_t(
+            x_, padding_sizes
+        )  # x will be of shape (B,C*2,H,W)
 
         x_ = x_ * std + mean
-        x_ = reshape_channel_complex_to_last_dim(x_).contiguous()  # x will be of shape (B,C,H,W,2)
+        x_ = reshape_channel_complex_to_last_dim(
+            x_
+        ).contiguous()  # x will be of shape (B,C,H,W,2)
         return torch.view_as_complex(x_)
-    

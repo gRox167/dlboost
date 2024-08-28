@@ -1,13 +1,10 @@
 # %%
 import math
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Tuple
 
 import einx
 import torch
-import torch.nn.functional as F
 import torch_dct as dct
-from icecream import ic
-from pyparsing import C
 from torch import Tensor, nn
 from torch.nn import (
     GELU,
@@ -15,8 +12,6 @@ from torch.nn import (
     LayerNorm,
     Linear,
     MultiheadAttention,
-    TransformerDecoder,
-    TransformerEncoder,
 )
 
 
@@ -272,7 +267,7 @@ class EncoderLayer(nn.Module):
     ) -> Tensor:
         b = x.shape[0]
         x = einx.rearrange("b sp l c -> (b sp) l c", x)
-        x = x + self.fourier_sa(x)
+        x = x + self.self_attn(x)
         x = einx.rearrange("(b sp) l c -> (b l) sp c", x, b=b)
         x = x + self.self_attn(x)
         return einx.rearrange("(b l) sp c -> b sp l c", x, b=b)
@@ -344,7 +339,7 @@ class DecoderLayer(nn.Module):
     ) -> Tensor:
         b = x.shape[0]
         x = einx.rearrange("b sp l c -> (b sp) l c", x)
-        x = x + self.fourier_sa(x)
+        x = x + self.self_attn(x)
         x = einx.rearrange("(b sp) l c -> (b l) sp c", x, b=b)
         x = x + self.self_attn(
             x,

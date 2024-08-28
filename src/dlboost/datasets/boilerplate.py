@@ -42,8 +42,59 @@ def recon_one_scan(dat_file_to_recon, phase_num=5, time_per_contrast=10):
     return_data["kspace_data_z"] = comp.normalization_root_of_sum_of_square(
         kspace_data_z
     )
-    return_data["kspace_data_z_compensated"] = comp.normalization_root_of_sum_of_square(
-        kspace_data_z * kspace_density_compensation[:, :, None, None, :, :] * 1000
+    return_data["kspace_data_z_compensated"] = (
+        comp.normalization_root_of_sum_of_square(
+            kspace_data_z
+            * kspace_density_compensation[:, :, None, None, :, :]
+            * 1000
+        )
+    )
+    return_data["kspace_density_compensation"] = kspace_density_compensation[
+        :, :, None, None, :, :
+    ]
+    # print(kspace_traj.shape)  # torch.Size([34, 5, 2, 15, 640])
+    # return_data["kspace_traj"] = (kspace_traj[:, :, 0]+1j*kspace_traj[:, :, 1])[
+    #     :, :, None, None, :, :]
+    return_data["kspace_traj"] = kspace_traj
+    return_data["cse"] = cse
+    # print(return_data["cse"].shape) # [15, 80, 320, 320]
+    return return_data
+
+
+def recon_one_scan_P2PDeCo(
+    dat_file_to_recon, phase_num=5, time_per_contrast=10
+):
+    reconstructor = recon.CAPTURE_VarW_NQM_DCE_PostInj(
+        dat_file_location=dat_file_to_recon,
+        phase_num=phase_num,
+        which_slice=-1,
+        which_contra=-1,
+        which_phase=-1,
+        time_per_contrast=time_per_contrast,
+        device=torch.device("cuda:1"),
+    )
+    raw_data = reconstructor.get_raw_data(reconstructor.dat_file_location)
+    reconstructor.args_init()
+
+    preprocessed_data = reconstructor.data_preprocess(raw_data)
+    _, _, kspace_data_z, kspace_traj, kspace_density_compensation, cse = (
+        preprocessed_data["kspace_data_centralized"],
+        preprocessed_data["kspace_data_mask"],
+        preprocessed_data["kspace_data_z"],
+        preprocessed_data["kspace_traj"],
+        preprocessed_data["kspace_density_compensation"],
+        preprocessed_data["cse"].coil_sens,
+    )
+    return_data = dict()
+    return_data["kspace_data_z"] = comp.normalization_root_of_sum_of_square(
+        kspace_data_z
+    )
+    return_data["kspace_data_z_compensated"] = (
+        comp.normalization_root_of_sum_of_square(
+            kspace_data_z
+            * kspace_density_compensation[:, :, None, None, :, :]
+            * 1000
+        )
     )
     return_data["kspace_density_compensation"] = kspace_density_compensation[
         :, :, None, None, :, :
@@ -86,10 +137,7 @@ def collate_fn(batch):
     batch_transposed = tree_transpose(
         tree_structure([0 for _ in batch]), tree_structure(batch[0]), batch
     )
-    return {
-        k: torch.stack([torch.from_numpy(b.to_numpy()) for b in v])
-        for k, v in batch_transposed.items()
-    }
+    return {k: torch.stack(v) for k, v in batch_transposed.items()}
 
 
 def check_top_k_channel(d, k=5):
@@ -162,7 +210,8 @@ class DCE_P2PCSE_KXKY_Dataset(Dataset):
             ]
             kspace_traj = torch.from_numpy(self.data["kspace_traj"][:, :, 0])
             kspace_data_z = rearrange(
-                torch.from_numpy(kspace_data_z), "ph ch sp len -> ph ch (sp len)"
+                torch.from_numpy(kspace_data_z),
+                "ph ch sp len -> ph ch (sp len)",
             )
             kspace_data_z_compensated = rearrange(
                 torch.from_numpy(kspace_data_z_compensated),
@@ -173,7 +222,9 @@ class DCE_P2PCSE_KXKY_Dataset(Dataset):
 
             # print(self.data["kspace_traj"].shape)
             kspace_traj = torch.view_as_real(kspace_traj).to(torch.float32)
-            kspace_traj = rearrange(kspace_traj, "ph () sp len c -> ph c (sp len)")
+            kspace_traj = rearrange(
+                kspace_traj, "ph () sp len c -> ph c (sp len)"
+            )
             return dict(
                 kspace_data_z=kspace_data_z,
                 kspace_data_z_compensated=kspace_data_z_compensated,
@@ -183,12 +234,15 @@ class DCE_P2PCSE_KXKY_Dataset(Dataset):
             )
         else:
             kspace_data_z = self.data[index]["kspace_data_z"][:]
-            kspace_data_z_compensated = self.data[index]["kspace_data_z_compensated"][:]
+            kspace_data_z_compensated = self.data[index][
+                "kspace_data_z_compensated"
+            ][:]
             kspace_traj = torch.from_numpy(
                 self.data[index]["kspace_traj"][:, :, 0]
             )  # ph, ch=1, z=1, sp, len
             kspace_data_z = rearrange(
-                torch.from_numpy(kspace_data_z), "ph ch z sp len -> ph ch z (sp len)"
+                torch.from_numpy(kspace_data_z),
+                "ph ch z sp len -> ph ch z (sp len)",
             )
             kspace_data_z_compensated = rearrange(
                 torch.from_numpy(kspace_data_z_compensated),
@@ -196,7 +250,9 @@ class DCE_P2PCSE_KXKY_Dataset(Dataset):
             )
             # print(self.data["kspace_traj"].shape)
             kspace_traj = torch.view_as_real(kspace_traj).to(torch.float32)
-            kspace_traj = rearrange(kspace_traj, "ph () sp len c -> ph c (sp len)")
+            kspace_traj = rearrange(
+                kspace_traj, "ph () sp len c -> ph c (sp len)"
+            )
             return dict(
                 kspace_data_z=kspace_data_z,
                 kspace_data_z_compensated=kspace_data_z_compensated,
