@@ -2,8 +2,6 @@ import os
 
 import numpy as np
 import torch
-from icecream import ic
-from lightning.pytorch.callbacks import BasePredictionWriter
 from nibabel import load
 from torch import multiprocessing as mp
 
@@ -31,13 +29,19 @@ def check_mk_dirs(paths):
                 os.makedirs(path)
     else:
         if not os.path.exists(paths):
-            os.makedirs(paths)
+            os.makedirs(
+                paths,
+            )
     return paths
 
 
 def from_label_to_onehot(labels, num_classes):
     one_hot = torch.zeros(
-        labels.size(0), num_classes, labels.size(2), labels.size(3), labels.size(4)
+        labels.size(0),
+        num_classes,
+        labels.size(2),
+        labels.size(3),
+        labels.size(4),
     ).to(labels.device)
     target = one_hot.scatter_(1, labels.to(torch.int64), 1)
     return target
@@ -59,7 +63,7 @@ def abs_helper(x, axis=1, is_normalization=True):
 
 def check_and_mkdir(path):
     if not os.path.exists(path):
-        os.mkdir(path)
+        os.makedirs(path)
 
 
 def dict2pformat(x: dict):
@@ -83,7 +87,9 @@ def dict2md_table(ipt: dict):
     return ret
 
 
-def write_test(log_dict, img_dict, save_path, is_save_mat=False, is_save_tiff=True):
+def write_test(
+    log_dict, img_dict, save_path, is_save_mat=False, is_save_tiff=True
+):
     if log_dict:
         # Write Log_dict Information
         cvs_data = np.array(list(log_dict.values()))
@@ -133,7 +139,11 @@ def write_test(log_dict, img_dict, save_path, is_save_mat=False, is_save_tiff=Tr
         ]:
             if key_ in img_dict:
                 print(key_, img_dict[key_].shape)
-                to_tiff(img_dict[key_], save_path + key_ + ".tiff", is_normalized=False)
+                to_tiff(
+                    img_dict[key_],
+                    save_path + key_ + ".tiff",
+                    is_normalized=False,
+                )
 
 
 def multi_processing_save_data(data, save_func):

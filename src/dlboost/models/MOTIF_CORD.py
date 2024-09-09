@@ -249,14 +249,13 @@ class MOTIF_CORD(nn.Module):
         # TODO Don know why, but gradient become nan after first iteration.
 
         # grad_dc_fn = grad(lambda img: self.inner_loss(img, kspace_data))
-        print(std)
+        # print(std)
         for t in range(self.iterations):
             print("iteration", t, "start")
             # apply forward model to get kspace_data_estimated
             # ic(t, x[0, 0, 0, 0, 0:10])
             # with torch.autograd.detect_anomaly():
             # ic(x[0, 0, 0, 0, 0:10])
-
             dc_loss = self.inner_loss(x.clone(), kspace_data, weights_flag)
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
             grad_reg = torch.zeros_like(x, dtype=torch.complex64)

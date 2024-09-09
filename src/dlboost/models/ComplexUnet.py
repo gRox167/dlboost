@@ -101,16 +101,19 @@ class ComplexUnet(nn.Module):
             x = einx.rearrange(
                 "b c1 ..., b c2 ... -> b (c1+c2) ...", x, input_append_channel
             )
+
+        x, pad_sizes = divisible_pad_t(x, self.pad_factor)
         x = self.unet(x)
+        x = inverse_divisible_pad_t(x, pad_sizes)
         x = reshape_channel_complex_to_last_dim(
             x
         )  # x will be of shape (B,C,H,W,2)
         x = torch.view_as_complex(x.contiguous())
-        if self.norm_with_given_std:
-            x = x * std
-        else:
-            x = x * std
-            # x = x * std + mean
+        # if self.norm_with_given_std:
+        #     x = x * std
+        # else:
+        x *= std
+        # x = x * std + mean
         return x
 
 

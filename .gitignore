@@ -41,3 +41,4 @@ wheels/
 **/tests
 **/wandb
 **/results
+**/.pyc

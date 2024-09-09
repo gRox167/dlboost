@@ -13,6 +13,66 @@ from .SpatialTransformNetwork import SpatialTransformNetwork
 
 # Some implementation here is adopted from VoxelMorph.
 
+# class VoxelMorph(nn.Module):
+#     """
+#     [cvpr2018_net] is a class representing the specific implementation for
+#     the 2018 implementation of voxelmorph.
+#     """
+
+#     def __init__(self, vol_size, in_channels, out_channels):
+#         """
+#         Instiatiate 2018 model
+#         :param vol_size: volume size of the atlas
+#         :param in_channels: the number of features maps for encoding stages
+#         :param out_channels: the number of features maps for decoding stages
+#         """
+#         super().__init__()
+
+#         dim = len(vol_size)
+#         self.unet = BasicUNet(
+#             spatial_dims=dim,
+#             in_channels=in_channels,
+#             out_channels=out_channels,
+#             features=(16, 32, 32, 32, 32, 32),
+#             act=(
+#                 "LeakyReLU",
+#                 {"negative_slope": 0.1, "inplace": True},
+#             ),
+#             norm=("instance", {"affine": True}),
+#             bias=True,
+#             dropout=0.0,
+#             upsample="nontrainable",
+#         )
+#         # self.unet_model = unet_core(dim, in_channels, out_channels, full_size)
+
+#         # One conv to get the flow field
+#         conv_fn = getattr(nn, "Conv%dd" % dim)
+#         self.flow = conv_fn(out_channels, dim, kernel_size=3, padding=1)
+
+#         # Make flow weights + bias small. Not sure this is necessary.
+#         nd = Normal(0, 1e-5)
+#         self.flow.weight = nn.Parameter(
+#             nd.sample(self.flow.weight.shape), requires_grad=True
+#         )
+#         self.flow.bias = nn.Parameter(
+#             torch.zeros(self.flow.bias.shape), requires_grad=True
+#         )
+
+#         self.spatial_transform = SpatialTransformNetwork(vol_size)
+
+#     def forward(self, src, tgt, to_warp=None):
+#         """
+#         Pass input x through forward once
+#             :param src: moving image that we want to shift
+#             :param tgt: fixed image that we want to shift to
+#         """
+#         x = torch.cat([src, tgt], dim=1)
+#         x = self.unet(x)
+#         flow = self.flow(x)
+#         y = self.spatial_transform(src, flow)
+
+#         return y, flow
+
 
 # noinspection PyUnresolvedReferences
 class unet_core(nn.Module):
@@ -126,7 +186,9 @@ class VoxelMorph(nn.Module):
             torch.zeros(self.flow.bias.shape), requires_grad=True
         )
 
-        self.spatial_transform = SpatialTransformNetwork(vol_size)  # , dims=dim)
+        self.spatial_transform = SpatialTransformNetwork(
+            vol_size
+        )  # , dims=dim)
 
     def forward(self, src, tgt, to_warp=None):
         """
