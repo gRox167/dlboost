@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Dict, Tuple
 
 import deepinv
 import einx
@@ -10,6 +10,7 @@ from jaxtyping import Shaped
 from mrboost.computation import nufft_2d, nufft_adj_2d
 from mrboost.type_utils import ComplexImage3D
 from torch import nn
+from torchopt.linear_solve import solve_normal_cg
 
 from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
@@ -22,7 +23,7 @@ class CSM_FixPh(LinearPhysics):
         super().__init__()
         self.scale_factor = scale_factor
 
-    def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "ch"]):
+    def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "b ch"]):
         if self.scale_factor is not None:
             self._csm = interpolate(
                 csm_kernels, scale_factor=self.scale_factor, mode="trilinear"
@@ -30,12 +31,12 @@ class CSM_FixPh(LinearPhysics):
         else:
             self._csm = csm_kernels
 
-    def A(self, image: Shaped[ComplexImage3D, "..."]):
-        return einx.dot("... d h w, ch d h w -> ... ch d h w", image, self._csm)
+    def A(self, image: Shaped[ComplexImage3D, "b ph"]):
+        return einx.dot("b ph ..., b ch ... -> b ph ch ...", image, self._csm)
 
-    def A_adjoint(self, image_multi_ch: Shaped[ComplexImage3D, "... ch"], **kwargs):
+    def A_adjoint(self, image_multi_ch: Shaped[ComplexImage3D, "b ph ch"], **kwargs):
         return einx.dot(
-            "... ch d h w, ch d h w -> ... d h w", image_multi_ch, self._csm
+            "b ph ch ..., b ch ...-> b ph ...", image_multi_ch, self._csm.conj()
         )
 
 
@@ -45,7 +46,7 @@ class MVF_Dyn(LinearPhysics):
         self.scale_factor = scale_factor
         self.spatial_transform = SpatialTransformNetwork(size=size, mode="bilinear")
 
-    def update_parameters(self, mvf_kernels: Shaped[torch.Tensor, "... ph v d h w"]):
+    def update_parameters(self, mvf_kernels: Shaped[torch.Tensor, "b ph v d h w"]):
         # self.ph_to_move = mvf_kernels.shape[0]
         # _mvf = einx.rearrange("ph v d h w -> ph v d h w", mvf_kernels)
         if self.scale_factor is not None:
@@ -53,49 +54,71 @@ class MVF_Dyn(LinearPhysics):
         else:
             self._mvf = mvf_kernels
         batches, self.ph_to_move, v, d, h, w = self._mvf.shape[-5:]
-        self.A_adjoint = adjoint_function(
+        self.A_adjoint_func = adjoint_function(
             self._mvf, batches + (self.ph_to_move + 1, d, h, w)
         )
 
-    def A(self, image: Shaped[ComplexImage3D, "..."]):
+    def A(self, image: Shaped[ComplexImage3D, "b d h w"]):
         image_moving = einx.rearrange(
-            "b... d h w cmplx-> (b... ph) cmplx d h w",
+            "b d h w cmplx-> (b ph) cmplx d h w",
             torch.view_as_real(image),
             ph=self.ph_to_move,
         )
         image_moved = self.spatial_transform(image_moving, self._mvf)
         image_moved = torch.view_as_complex(
             einx.rearrange(
-                "(b... ph) cmplx d h w -> b... ph d h w cmplx",
+                "(b ph) cmplx d h w -> b ph d h w cmplx",
                 image_moved,
                 cmplx=2,
                 ph=self.ph_to_move,
             )
         )
         return einx.rearrange(
-            "b... ph d h w , b... d h w -> b... (ph + 1) d h w",
+            "b ph d h w, b d h w -> b (ph + 1) d h w",
             image_moved,
             image,
         )
+
+    def A_adjoint(self, y, **kwargs):
+        return self.A_adjoint_func(y, **kwargs)
+
+
+class Repeat(LinearPhysics):
+    def __init__(self, pattern: str, repeats: Dict):
+        super().__init__()
+        self.pattern = pattern
+        self.repeats = repeats
+
+    def update_parameters(self, repeats):
+        self.repeats = repeats
+
+    def A(self, x):
+        return einx.rearrange(self.pattern, x, **self.repeats)
+
+    def A_adjoint(self, y, **kwargs):
+        in_, out_ = self.pattern.split("->")
+        return einx.sum(out_ + "->" + in_, y, **self.repeats)
 
 
 class NUFFT(LinearPhysics):
     def __init__(self, nufft_im_size):
         super().__init__()
         self.nufft_im_size = nufft_im_size
-        self.A_adjoint = adjoint_function(
-            self.A,
-        )
 
     def update_parameters(self, kspace_traj):
         self.kspace_traj = kspace_traj
+        # self.A_adjoint = adjoint_function(
+        #     self.A,
+        # )
 
     def A(self, image):
         return nufft_2d(
             image,
             self.kspace_traj,
             self.nufft_im_size,
-            norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # use this line if you have RO oversampling
+            norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
         )
 
     def A_adjoint(self, kspace_data):
@@ -103,27 +126,26 @@ class NUFFT(LinearPhysics):
             kspace_data,
             self.kspace_traj,
             self.nufft_im_size,
-            adjoint=True,
-            norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # use this line if you have RO oversampling
+            norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
         )
 
 
 class MR_Forward_Model(LinearPhysics):
     def __init__(
         self,
-        image_size,
-        nufft_im_size,
-        CSM_physics=CSM_FixPh,
-        MVF_physics=MVF_Dyn,
-        NUFFT_physics=NUFFT,
+        MVF_physics=MVF_Dyn((80, 320, 320)),
+        CSM_physics=CSM_FixPh((1, 8, 8)),
+        NUFFT_physics=NUFFT((320, 320)),
     ):
         super().__init__()
-        self.M = MVF_physics(image_size)
-        self.S = CSM_physics()
-        self.N = NUFFT_physics(nufft_im_size)
+        self.M = MVF_physics
+        self.S = CSM_physics
+        self.N = NUFFT_physics
         self.forward_model = self.N * self.S * self.M
 
-    def update_parameters(self, mvf_kernels, csm_kernels, kspace_traj):
+    def update_parameters(self, mvf_kernels=None, csm_kernels=None, kspace_traj=None):
         if hasattr(self.M, "update_parameters"):
             self.M.update_parameters(mvf_kernels)
         self.S.update_parameters(csm_kernels)
@@ -134,6 +156,35 @@ class MR_Forward_Model(LinearPhysics):
 
     def A_adjoint(self, kspace_data):
         return self.forward_model.A_adjoint(kspace_data)
+
+    def A_dagger(self, y, **kwargs):
+        solver = solve_normal_cg(init=self.A_adjoint(y), **kwargs)
+        x_hat = solver(self.A, y)
+        return x_hat
+
+    def prox_l2(self, z, y, gamma, **kwargs):
+        r"""
+        Computes proximal operator of :math:`f(x) = \frac{1}{2}\|Ax-y\|^2`, i.e.,
+
+        .. math::
+
+            \underset{x}{\arg\min} \; \frac{\gamma}{2}\|Ax-y\|^2 + \frac{1}{2}\|x-z\|^2
+
+        :param torch.Tensor y: measurements tensor
+        :param torch.Tensor z: signal tensor
+        :param float gamma: hyperparameter of the proximal operator
+        :return: (torch.Tensor) estimated signal tensor
+
+        """
+        b = self.A_adjoint(y) + 1 / gamma * z
+
+        def H(x):
+            print(x.shape)
+            return self.A(self.A_adjoint(x)) + 1 / gamma * x
+
+        solver = solve_normal_cg(init=None)
+        x = solver(H, b, rtol=1e-2)
+        return x
 
 
 class ComplexRED(RED):
