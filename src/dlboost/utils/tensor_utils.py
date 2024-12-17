@@ -2,10 +2,14 @@ from functools import partial
 from types import NoneType
 from typing import (
     Dict,
+    List,
+    Pattern,
     Sequence,
+    Tuple,
     Union,
 )
-
+import re
+from sklearn.model_selection import KFold
 import einops as eo
 import torch
 from jaxtyping import PyTree
@@ -19,9 +23,7 @@ from xarray import DataArray
 def complex_as_real_2ch(x):
     # breakpoint()
     if len(x.shape) == 4:
-        return eo.rearrange(
-            torch.view_as_real(x), "b c h w cmplx-> b (c cmplx) h w"
-        )
+        return eo.rearrange(torch.view_as_real(x), "b c h w cmplx-> b (c cmplx) h w")
     elif len(x.shape) == 5:
         return eo.rearrange(
             torch.view_as_real(x), "b c d h w cmplx-> b (c cmplx) d h w"
@@ -343,3 +345,53 @@ def crop(
 @dispatch
 def crop(data, dims, start_indices, crop_sizes):
     pass
+
+
+def hybrid_kfold_split(
+    items: List[str],
+    fixed_pattern: Union[str, Pattern],
+    n_splits: int = 5,
+    fold_idx: int = 0,
+    random_state: int = 42,
+    verbose: bool = False,
+) -> Tuple[List[int], List[int]]:
+    """
+    Performs a hybrid K-fold split where some items are fixed in training set based on a pattern,
+    while others participate in cross-validation.
+
+    Args:
+        items: List of items (e.g., file paths, IDs) to split
+        fixed_pattern: Regex pattern to identify items that should always be in training set
+        n_splits: Number of folds for cross-validation
+        fold_idx: Which fold to use (0 to n_splits-1)
+        random_state: Random seed for reproducibility
+        verbose: Whether to print debug information
+
+    Returns:
+        Tuple of (train_indices, val_indices)
+    """
+    # Find items matching the fixed pattern
+    if isinstance(fixed_pattern, str):
+        fixed_pattern = re.compile(fixed_pattern)
+
+    m_list = [fixed_pattern.search(item) for item in items]
+
+    # Items that should always be in training set
+    fixed_train_idx = [i for i, m in enumerate(m_list) if m is not None]
+
+    # Items that participate in cross-validation
+    cv_idx = [i for i, m in enumerate(m_list) if m is None]
+
+    # Perform k-fold split on the cross-validation items
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    cv_splits = list(kf.split(cv_idx))
+    cv_train_idx, cv_val_idx = cv_splits[fold_idx]
+
+    # Combine fixed training indices with cross-validation training indices
+    train_idx = fixed_train_idx + [cv_idx[i] for i in cv_train_idx]
+    val_idx = [cv_idx[i] for i in cv_val_idx]
+
+    if verbose:
+        ic(train_idx, val_idx)
+
+    return train_idx, val_idx

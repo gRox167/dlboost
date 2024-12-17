@@ -10,7 +10,7 @@ from jaxtyping import Shaped
 from mrboost.computation import nufft_2d, nufft_adj_2d
 from mrboost.type_utils import ComplexImage3D
 from torch import nn
-from torchopt.linear_solve import solve_normal_cg
+from torchopt.linear_solve import solve_cg, solve_normal_cg
 
 from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
@@ -179,11 +179,11 @@ class MR_Forward_Model(LinearPhysics):
         b = self.A_adjoint(y) + 1 / gamma * z
 
         def H(x):
-            print(x.shape)
-            return self.A(self.A_adjoint(x)) + 1 / gamma * x
+            return self.A_adjoint(self.A(x)) + 1 / gamma * x
 
-        solver = solve_normal_cg(init=None)
+        solver = solve_cg(init=z)
         x = solver(H, b, rtol=1e-2)
+        print("1 iteration")
         return x
 
 
@@ -215,33 +215,33 @@ class ComplexRED(RED):
         return x - self.denoiser(x)
 
 
-# class Regularization(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.image_denoiser = ComplexUnet(
-#             1,
-#             1,
-#             spatial_dims=3,
-#             conv_net=DWUNet(
-#                 in_channels=2,
-#                 out_channels=2,
-#                 features=(16, 32, 64, 128, 256),
-#                 # features=(32, 64, 128, 256, 512),
-#                 strides=((2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2)),
-#                 kernel_sizes=(
-#                     (3, 3, 3),
-#                     (3, 3, 3),
-#                     (3, 3, 3),
-#                     (3, 3, 3),
-#                     (3, 3, 3),
-#                 ),
-#             ),
-#             norm_with_given_std=True,
-#         )
+class Regularization(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.image_denoiser = ComplexUnet(
+            1,
+            1,
+            spatial_dims=3,
+            conv_net=DWUNet(
+                in_channels=2,
+                out_channels=2,
+                features=(16, 32, 64, 128, 256),
+                # features=(32, 64, 128, 256, 512),
+                strides=((2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2)),
+                kernel_sizes=(
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                ),
+            ),
+            norm_with_given_std=True,
+        )
 
-#     def forward(self, params, std=None):
-#         params = params.clone()
-#         return self.image_denoiser(params, std=std)
+    def forward(self, params, std=None):
+        # params = params.clone()
+        return self.image_denoiser(params, std=std)
 
 
 class Identity_Regularization:
