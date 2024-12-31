@@ -1,11 +1,11 @@
 import einx
 import torch
+from mrboost.computation import nufft_2d, nufft_adj_2d
 from torch import nn
 
 from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
-from mrboost.computation import generate_nufft_op, nufft_2d, nufft_adj_2d
 
 
 class CSM_FixPh(nn.Module):
@@ -39,9 +39,7 @@ class CSM_FixPh(nn.Module):
 class MVF_Dyn(nn.Module):
     def __init__(self, size):
         super().__init__()
-        self.spatial_transform = SpatialTransformNetwork(
-            size=size, mode="bilinear"
-        )
+        self.spatial_transform = SpatialTransformNetwork(size=size, mode="bilinear")
         # if upsample_times:
         #     def upsample(x):
         #         for i in range(upsample_times):
@@ -54,9 +52,7 @@ class MVF_Dyn(nn.Module):
     def generate_forward_operator(self, mvf_kernels):
         if mvf_kernels is not None:
             self.ph_to_move = mvf_kernels.shape[1]
-            _mvf = einx.rearrange(
-                "b ph v d h w -> (b ph) v d h w", mvf_kernels.clone()
-            )
+            _mvf = einx.rearrange("b ph v d h w -> (b ph) v d h w", mvf_kernels.clone())
             self._mvf = resize_deformation_field(_mvf, (1, 2, 2))
         else:
             self._mvf = None
@@ -91,15 +87,6 @@ class NUFFT(nn.Module):
     def __init__(self, nufft_im_size):
         super().__init__()
         self.nufft_im_size = nufft_im_size
-        nufft_op, nufft_adj_op = generate_nufft_op(nufft_im_size)
-        self.nufft_cse = torch.vmap(
-            nufft_op
-        )  # image: b ch d h w; ktraj: b 2 len
-        self.nufft_adj_cse = torch.vmap(nufft_adj_op)  # kdata: b ch d len
-        self.nufft = torch.vmap(torch.vmap(nufft_op))
-        # image: b ph ch d h w; ktraj: b ph 2 len
-        self.nufft_adj = torch.vmap(torch.vmap(nufft_adj_op))
-        # kdata: b ph ch d len
 
     def generate_forward_operator(self, kspace_traj):
         self.kspace_traj = kspace_traj
@@ -281,14 +268,10 @@ class MOTIF_CORD(nn.Module):
         # ic(kspace_data_estimated[0, 0, 0, 0, 0:10])
         if weights_flag:
             kspace_data_estimated_detatched = (
-                kspace_data_estimated[:, :, :, self.effective_slice]
-                .detach()
-                .abs()
+                kspace_data_estimated[:, :, :, self.effective_slice].detach().abs()
             )
             norm_factor = kspace_data_estimated_detatched.max()
-            weights = 1 / (
-                kspace_data_estimated_detatched / norm_factor + self.epsilon
-            )
+            weights = 1 / (kspace_data_estimated_detatched / norm_factor + self.epsilon)
         else:
             weights = 1
 
@@ -297,8 +280,6 @@ class MOTIF_CORD(nn.Module):
             torch.view_as_real(
                 weights * kspace_data_estimated[:, :, :, self.effective_slice]
             ),
-            torch.view_as_real(
-                weights * kspace_data[:, :, :, self.effective_slice]
-            ),
+            torch.view_as_real(weights * kspace_data[:, :, :, self.effective_slice]),
         )
         return loss_dc

@@ -1,3 +1,4 @@
+import re
 from functools import partial
 from types import NoneType
 from typing import (
@@ -8,13 +9,13 @@ from typing import (
     Tuple,
     Union,
 )
-import re
-from sklearn.model_selection import KFold
+
 import einops as eo
 import torch
 from jaxtyping import PyTree
-from optree import tree_map
+from optree import tree_map, tree_structure, tree_transpose
 from plum import dispatch, overload
+from sklearn.model_selection import KFold
 from torch import Tensor
 from torch.nn import functional as f
 from xarray import DataArray
@@ -353,6 +354,7 @@ def hybrid_kfold_split(
     n_splits: int = 5,
     fold_idx: int = 0,
     random_state: int = 42,
+    return_fix_idx=False,
     verbose: bool = False,
 ) -> Tuple[List[int], List[int]]:
     """
@@ -393,5 +395,17 @@ def hybrid_kfold_split(
 
     if verbose:
         ic(train_idx, val_idx)
-
+    if return_fix_idx:
+        return train_idx, val_idx, fixed_train_idx
     return train_idx, val_idx
+
+
+def collate_fn(batch):
+    # transpose dict structure out of list
+    batch_transposed = tree_transpose(
+        tree_structure([0 for _ in batch]), tree_structure(batch[0]), batch
+    )
+    return {
+        k: torch.stack(v) if torch.is_tensor(v[0]) else v
+        for k, v in batch_transposed.items()
+    }
