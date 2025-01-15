@@ -119,7 +119,15 @@ def registration_main(config, device, moving, fixed):
     return best_df, best_df_with_grid, best_warped_moving
 
 
-def registration(device, moving, fixed, verbose=False):
+def registration(
+    device,
+    moving,
+    fixed,
+    magnitude_coef=0.00005,
+    jacobian_coef=2.5,
+    smooth_coef=0.05,
+    verbose=False,
+):
     """
     Registration moving to fixed.
     :param config: configurations.
@@ -163,11 +171,11 @@ def registration(device, moving, fixed, verbose=False):
         # similarity loss
         loss_sim = loss_NCC(warped_moving, fixed)
         # V magnitude loss
-        loss_v = 0.00005 * magnitude_loss(all_v)
+        loss_v = magnitude_coef * magnitude_loss(all_v)
         # neg Jacobian loss
-        loss_J = 2.5 * neg_Jdet_loss(df_with_grid)
+        loss_J = jacobian_coef * neg_Jdet_loss(df_with_grid)
         # phi dphi/dx loss
-        loss_df = 0.05 * smoothloss_loss(df)
+        loss_df = smooth_coef * smoothloss_loss(df)
         loss = loss_sim + loss_v + loss_J + loss_df
         optimizer.zero_grad()
         loss.backward()

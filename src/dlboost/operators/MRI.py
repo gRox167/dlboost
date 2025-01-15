@@ -8,8 +8,8 @@ from dlboost.models import SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
 from jaxtyping import Shaped
-from mrboost.computation import nufft_2d, nufft_adj_2d
-from mrboost.type_utils import ComplexImage3D
+from mrboost.computation import fft_1D, ifft_1D, nufft_2d, nufft_adj_2d
+from mrboost.type_utils import ComplexImage3D, KspaceData
 from torchopt.linear_solve import solve_cg
 
 
@@ -46,12 +46,21 @@ class MVF_Dyn(LinearPhysics):
         # self.ph_to_move = mvf_kernels.shape[0]
         # _mvf = einx.rearrange("ph v d h w -> ph v d h w", mvf_kernels)
         if self.scale_factor is not None:
-            self._mvf = resize_deformation_field(mvf_kernels, self.scale_factor)
+            b, ph, v, d, h, w = mvf_kernels.shape
+            mvf_kernels = einx.rearrange("b ph v z h w -> (b ph) v z h w", mvf_kernels)
+            mvf_kernels = resize_deformation_field(mvf_kernels, self.scale_factor)
+            self._mvf = einx.rearrange(
+                "(b ph) v z h w -> b ph v z h w", mvf_kernels, ph=ph
+            )
         else:
             self._mvf = mvf_kernels
-        batches, self.ph_to_move, v, d, h, w = self._mvf.shape[-5:]
+        batches, self.ph_to_move, v, d, h, w = self._mvf.shape
         self.A_adjoint_func = adjoint_function(
-            self._mvf, batches + (self.ph_to_move + 1, d, h, w)
+            self.A,
+            # (batches, self.ph_to_move + 1, d, h, w),
+            (batches, d, h, w),
+            device=self._mvf.device,
+            dtype=torch.complex64,
         )
 
     def A(self, image: Shaped[ComplexImage3D, "b d h w"]):
@@ -60,14 +69,17 @@ class MVF_Dyn(LinearPhysics):
             torch.view_as_real(image),
             ph=self.ph_to_move,
         )
-        image_moved = self.spatial_transform(image_moving, self._mvf)
+        mvf = einx.rearrange(
+            "b ph v d h w -> (b ph) v d h w", self._mvf, ph=self.ph_to_move
+        )
+        image_moved = self.spatial_transform(image_moving, mvf)
         image_moved = torch.view_as_complex(
             einx.rearrange(
                 "(b ph) cmplx d h w -> b ph d h w cmplx",
                 image_moved,
                 cmplx=2,
                 ph=self.ph_to_move,
-            )
+            ).contiguous()
         )
         return einx.rearrange(
             "b ph d h w, b d h w -> b (ph + 1) d h w",
@@ -118,6 +130,46 @@ class NUFFT(LinearPhysics):
         )
 
     def A_adjoint(self, kspace_data):
+        return nufft_adj_2d(
+            kspace_data,
+            self.kspace_traj,
+            self.nufft_im_size,
+            norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # use this line if you have RO oversampling
+            # norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
+        )
+
+
+class NUFFT_2D_FFT_1D(LinearPhysics):
+    def __init__(self, nufft_im_size):
+        super().__init__()
+        self.nufft_im_size = nufft_im_size
+
+    def update_parameters(self, kspace_traj):
+        self.kspace_traj = kspace_traj
+
+    def A(
+        self,
+        image: Shaped[ComplexImage3D, "b ph ch"],
+    ):
+        _kxkyz = nufft_2d(
+            image,
+            self.kspace_traj,
+            self.nufft_im_size,
+            norm_factor=2
+            * np.sqrt(
+                np.prod(self.nufft_im_size)
+            ),  # use this line if you have RO oversampling
+            # norm_factor=np.sqrt(np.prod(self.nufft_im_size)), # use this line if you don't have RO oversampling
+        )
+        kspace_data = fft_1D(_kxkyz, dim=3)
+        return kspace_data
+
+    def A_adjoint(
+        self,
+        kspace_data: Shaped[KspaceData, "b ph ch kz"],
+    ):
+        _kxkyz = ifft_1D(kspace_data, dim=3)
         return nufft_adj_2d(
             kspace_data,
             self.kspace_traj,

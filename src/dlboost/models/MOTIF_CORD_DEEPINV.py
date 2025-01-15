@@ -6,13 +6,13 @@ from torch import nn
 from torchopt.linear_solve import solve_cg, solve_normal_cg
 
 from dlboost.models import ComplexUnet, DWUNet
-from dlboost.operators import NUFFT, CSM_FixPh, MVF_Dyn
+from dlboost.operators.MRI import NUFFT, CSM_FixPh, MVF_Dyn, Repeat
 
 
 class MR_Forward_Model(LinearPhysics):
     def __init__(
         self,
-        MVF_physics=MVF_Dyn((80, 320, 320)),
+        MVF_physics: MVF_Dyn | Repeat = MVF_Dyn((80, 320, 320)),
         CSM_physics=CSM_FixPh((1, 8, 8)),
         NUFFT_physics=NUFFT((320, 320)),
     ):
