@@ -8,14 +8,56 @@ from dlboost.models import SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
 from jaxtyping import Shaped
-from mrboost.computation import fft_1D, ifft_1D, nufft_2d, nufft_adj_2d
-from mrboost.type_utils import ComplexImage3D, KspaceData
-from torchopt.linear_solve import solve_cg
+from mrboost.computation import (
+    fft_1D,
+    ifft_1D,
+    kspace_point_to_radial_spokes,
+    nufft_2d,
+    nufft_3d,
+    nufft_adj_2d,
+    nufft_adj_3d,
+    radial_spokes_to_kspace_point,
+)
+from mrboost.type_utils import ComplexImage3D, KspaceSpokesData, KspaceSpokesTraj
+from torchopt.linear_solve import solve_cg, solve_normal_cg
+
+
+class CSM(LinearPhysics):
+    def __init__(
+        self,
+        scale_factor: Tuple[int, int, int] | None = (1, 8, 8),
+        # compute_device="cuda",
+        # storage_device="cpu",
+    ):
+        super().__init__()
+        self.scale_factor = scale_factor
+        # self.compute_device = compute_device
+        # self.storage_device = storage_device
+
+    def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "b ch"]):
+        if self.scale_factor is not None:
+            self._csm = interpolate(
+                csm_kernels, scale_factor=self.scale_factor, mode="trilinear"
+            )
+        else:
+            self._csm = csm_kernels
+
+    def A(self, image: Shaped[ComplexImage3D, "b"]):
+        return einx.dot("b ..., b ch ... -> b ch ...", image, self._csm)
+
+    def A_adjoint(self, image_multi_ch: Shaped[ComplexImage3D, "b ch"], **kwargs):
+        return einx.sum(
+            "b [ch] ...", image_multi_ch * self._csm.conj()
+        )  # .to(self.compute_device)
 
 
 class CSM_FixPh(LinearPhysics):
-    # python type tuple length 3
-    def __init__(self, scale_factor: Tuple[int, int, int] | None = (1, 8, 8)):
+    def __init__(
+        self,
+        scale_factor: Tuple[int, int, int] | None = (1, 8, 8),
+        # compute_device="cuda",
+        # storage_device="cpu",
+    ):
         super().__init__()
         self.scale_factor = scale_factor
 
@@ -115,9 +157,6 @@ class NUFFT(LinearPhysics):
 
     def update_parameters(self, kspace_traj):
         self.kspace_traj = kspace_traj
-        # self.A_adjoint = adjoint_function(
-        #     self.A,
-        # )
 
     def A(self, image):
         return nufft_2d(
@@ -140,7 +179,7 @@ class NUFFT(LinearPhysics):
         )
 
 
-class NUFFT_2D_FFT_1D(LinearPhysics):
+class NUFFT_3D(LinearPhysics):
     def __init__(self, nufft_im_size):
         super().__init__()
         self.nufft_im_size = nufft_im_size
@@ -148,36 +187,104 @@ class NUFFT_2D_FFT_1D(LinearPhysics):
     def update_parameters(self, kspace_traj):
         self.kspace_traj = kspace_traj
 
+    def A(self, image):
+        output = nufft_3d(
+            image,
+            radial_spokes_to_kspace_point(self.kspace_traj),
+            self.nufft_im_size,
+            norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # use this line if you have RO oversampling
+            # norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
+        )
+        return kspace_point_to_radial_spokes(output, self.kspace_traj.shape[-1])
+
+    def A_adjoint(self, kspace_data: Shaped[KspaceSpokesData, "..."]):
+        return nufft_adj_3d(
+            radial_spokes_to_kspace_point(kspace_data),
+            radial_spokes_to_kspace_point(self.kspace_traj),
+            self.nufft_im_size,
+            norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # use this line if you have RO oversampling
+            # norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
+        )
+
+
+class NUFFT_2D_FFT_1D(LinearPhysics):
+    def __init__(self):  # , compute_device, storage_device):
+        super().__init__()
+        # self.compute_device = compute_device
+        # self.storage_device = storage_device
+
+    def update_parameters(self, kspace_traj, nufft_im_size=None):
+        if nufft_im_size is not None:
+            self.nufft_im_size = nufft_im_size
+        if kspace_traj is not None:
+            self.spoke_len = kspace_traj.shape[-1]
+            self.kspace_traj = radial_spokes_to_kspace_point(kspace_traj)
+
     def A(
         self,
-        image: Shaped[ComplexImage3D, "b ph ch"],
-    ):
+        image: Shaped[ComplexImage3D, "*b ch"],
+    ) -> Shaped[KspaceSpokesData, "*b ch kz"]:
         _kxkyz = nufft_2d(
             image,
-            self.kspace_traj,
-            self.nufft_im_size,
-            norm_factor=2
-            * np.sqrt(
-                np.prod(self.nufft_im_size)
-            ),  # use this line if you have RO oversampling
-            # norm_factor=np.sqrt(np.prod(self.nufft_im_size)), # use this line if you don't have RO oversampling
-        )
-        kspace_data = fft_1D(_kxkyz, dim=3)
-        return kspace_data
-
-    def A_adjoint(
-        self,
-        kspace_data: Shaped[KspaceData, "b ph ch kz"],
-    ):
-        _kxkyz = ifft_1D(kspace_data, dim=3)
-        return nufft_adj_2d(
-            kspace_data,
             self.kspace_traj,
             self.nufft_im_size,
             norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
             # use this line if you have RO oversampling
             # norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
         )
+        kspace_data = fft_1D(_kxkyz, dim=-2)
+        return kspace_point_to_radial_spokes(kspace_data, self.spoke_len)
+
+    def A_adjoint(
+        self,
+        kspace_data: Shaped[KspaceSpokesData, "*b ch kz"],
+    ) -> Shaped[ComplexImage3D, "*b ch"]:
+        kspace_data = radial_spokes_to_kspace_point(kspace_data)
+        _kxkyz = ifft_1D(kspace_data, dim=-2)
+        return nufft_adj_2d(
+            _kxkyz,
+            self.kspace_traj,
+            self.nufft_im_size,
+            norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)),
+            # use this line if you have RO oversampling
+            # norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
+        )
+
+
+class KspaceMask_kz(LinearPhysics):
+    def __init__(self):
+        super().__init__()
+        self.kspace_mask = None
+
+    def update_parameters(self, kspace_mask):
+        self.kspace_mask = kspace_mask
+
+    def A(self, kspace_data: Shaped[KspaceSpokesData, "b ph ch kz"]):
+        return einx.dot(
+            "b ph ch kz ..., kz -> b ph ch kz ...", kspace_data, self.kspace_mask
+        )
+
+    def A_adjoint(self, kspace_data: Shaped[KspaceSpokesData, "b ph ch kz"]):
+        return einx.dot(
+            "b ph ch kz ..., kz -> b ph ch kz ...", kspace_data, self.kspace_mask
+        )
+
+
+class KspaceMask(LinearPhysics):
+    def __init__(self):
+        super().__init__()
+        self.kspace_mask = None
+
+    def update_parameters(self, kspace_mask):
+        self.kspace_mask = kspace_mask
+
+    def A(self, kspace_data):
+        return kspace_data * self.kspace_mask
+
+    def A_adjoint(self, kspace_data):
+        return kspace_data * self.kspace_mask
 
 
 class ConjugateGradientFunction(torch.autograd.Function):
@@ -228,6 +335,75 @@ class ConjugateGradientFunction(torch.autograd.Function):
             solver = solve_cg(init=b)
             grad_b = solver(ctx.A, grad_output, rtol=ctx.rtol, max_iter=ctx.max_iter)
         return (None, grad_b, None, None, None)
+
+
+class RadialVibePhysics(LinearPhysics):
+    def __init__(
+        self,
+        csm_operator=CSM(None),
+        nufft_operator=NUFFT_2D_FFT_1D(),
+        kspace_mask_operator=KspaceMask(),
+    ):
+        super().__init__()
+        self.csm_operator = csm_operator
+        self.nufft_operator = nufft_operator
+        self.kspace_mask_operator = kspace_mask_operator
+
+    def update_parameters(
+        self,
+        ktraj: Shaped[KspaceSpokesTraj, "b"] | None = None,
+        csm: Shaped[ComplexImage3D, "b ch"] | None = None,
+        kspace_mask: Shaped[KspaceSpokesData, "b ch kz"] | None = None,
+        nufft_im_size: tuple[int, int] | None = None,
+    ):
+        if ktraj is not None:
+            self.ktraj = ktraj  # (b, 2, sp, len)
+            self.nufft_operator.update_parameters(ktraj, nufft_im_size)
+
+        if csm is not None:
+            self.csm = csm
+            self.csm_operator.update_parameters(csm)
+
+        if kspace_mask is not None:
+            self.kspace_mask_operator.update_parameters(kspace_mask)
+
+    def A(
+        self, x: Shaped[ComplexImage3D, "b d h w"]
+    ) -> Shaped[KspaceSpokesData, "b ch kz"]:
+        # Apply coil sensitivity operator
+        x_coils = self.csm_operator.A(x)
+
+        # Apply NUFFT and 1D FFT
+        kspace_data = self.nufft_operator.A(x_coils)
+
+        # Apply kspace mask operator
+        kspace_data = self.kspace_mask_operator.A(kspace_data)
+
+        return kspace_data
+
+    def A_adjoint(
+        self, y: Shaped[KspaceSpokesData, "b ch kz"]
+    ) -> Shaped[ComplexImage3D, "b d h w"]:
+        # Apply adjoint of NUFFT and 1D FFT
+        image_coils = self.nufft_operator.A_adjoint(y)
+
+        # Apply adjoint of coil sensitivity operator
+        image = self.csm_operator.A_adjoint(image_coils)
+
+        # Apply adjoint of kspace mask operator
+        image = self.kspace_mask_operator.A_adjoint(image)
+
+        return image
+
+    def A_dagger(self, y, x_init=None, **kwargs):
+        # if x_init in kwargs, use it as the initial guess
+        if x_init is not None:
+            init = x_init
+        else:
+            init = self.A_adjoint(y)
+        solver = solve_normal_cg(init=init, **kwargs)
+        x_hat = solver(self.A, y)
+        return x_hat
 
 
 if __name__ == "__main__":

@@ -1,12 +1,20 @@
 import deepinv
 import torch
-from deepinv.optim import RED
+from deepinv.optim import RED, OptimIterator, Prior
+from deepinv.optim.optimizers import fStep, gStep
 from deepinv.physics import LinearPhysics
 from torch import nn
 from torchopt.linear_solve import solve_cg, solve_normal_cg
 
 from dlboost.models import ComplexUnet, DWUNet
-from dlboost.operators.MRI import NUFFT, CSM_FixPh, MVF_Dyn, Repeat
+from dlboost.operators.MRI import (
+    NUFFT,
+    NUFFT_2D_FFT_1D,
+    CSM_FixPh,
+    KspaceMask_kz,
+    MVF_Dyn,
+    Repeat,
+)
 
 
 class MR_Forward_Model(LinearPhysics):
@@ -15,18 +23,27 @@ class MR_Forward_Model(LinearPhysics):
         MVF_physics: MVF_Dyn | Repeat = MVF_Dyn((80, 320, 320)),
         CSM_physics=CSM_FixPh((1, 8, 8)),
         NUFFT_physics=NUFFT((320, 320)),
+        KspaceMask_physics=None,
     ):
         super().__init__()
         self.M = MVF_physics
         self.S = CSM_physics
         self.N = NUFFT_physics
-        self.forward_model = self.N * self.S * self.M
+        if KspaceMask_physics is None:
+            self.forward_model = self.N * self.S * self.M
+        else:
+            self.MASK = KspaceMask_physics
+            self.forward_model = self.MASK * self.N * self.S * self.M
 
-    def update_parameters(self, mvf_kernels=None, csm_kernels=None, kspace_traj=None):
+    def update_parameters(
+        self, mvf_kernels=None, csm_kernels=None, kspace_traj=None, kspace_mask=None
+    ):
         if hasattr(self.M, "update_parameters"):
             self.M.update_parameters(mvf_kernels)
         self.S.update_parameters(csm_kernels)
         self.N.update_parameters(kspace_traj)
+        if hasattr(self, "MASK"):
+            self.MASK.update_parameters(kspace_mask)
 
     def A(self, image):
         return self.forward_model.A(image)
@@ -34,8 +51,13 @@ class MR_Forward_Model(LinearPhysics):
     def A_adjoint(self, kspace_data):
         return self.forward_model.A_adjoint(kspace_data)
 
-    def A_dagger(self, y, **kwargs):
-        solver = solve_normal_cg(init=self.A_adjoint(y), **kwargs)
+    def A_dagger(self, y, x_init=None, **kwargs):
+        # if x_init in kwargs, use it as the initial guess
+        if x_init is not None:
+            init = x_init
+        else:
+            init = self.A_adjoint(y)
+        solver = solve_normal_cg(init=init, **kwargs)
         x_hat = solver(self.A, y)
         return x_hat
 
@@ -60,65 +82,7 @@ class MR_Forward_Model(LinearPhysics):
 
         solver = solve_cg(init=z)
         x = solver(H, b, rtol=1e-2)
-        print("1 iteration")
         return x
-
-
-class ComplexRED(RED):
-    def __init__(self):
-        self.denoiser = ComplexUnet(
-            1,
-            1,
-            spatial_dims=3,
-            conv_net=DWUNet(
-                in_channels=2,
-                out_channels=2,
-                features=(16, 32, 64, 128, 256),
-                # features=(32, 64, 128, 256, 512),
-                strides=((2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2)),
-                kernel_sizes=(
-                    (3, 3, 3),
-                    (3, 3, 3),
-                    (3, 3, 3),
-                    (3, 3, 3),
-                    (3, 3, 3),
-                ),
-            ),
-            norm_with_given_std=False,
-        )
-        super().__init__(denoiser=self.denoiser)
-
-    def grad(self, x):
-        return x - self.denoiser(x)
-
-
-class Regularization(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.image_denoiser = ComplexUnet(
-            1,
-            1,
-            spatial_dims=3,
-            conv_net=DWUNet(
-                in_channels=2,
-                out_channels=2,
-                features=(16, 32, 64, 128, 256),
-                # features=(32, 64, 128, 256, 512),
-                strides=((2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2)),
-                kernel_sizes=(
-                    (3, 3, 3),
-                    (3, 3, 3),
-                    (3, 3, 3),
-                    (3, 3, 3),
-                    (3, 3, 3),
-                ),
-            ),
-            norm_with_given_std=True,
-        )
-
-    def forward(self, params, std=None):
-        # params = params.clone()
-        return self.image_denoiser(params, std=std)
 
 
 class Identity_Regularization:
@@ -129,110 +93,112 @@ class Identity_Regularization:
         return params
 
 
-class MOTIF_CORD(nn.Module):
-    def __init__(
-        self,
-        patch_size: tuple = (16, 320, 320),
-        patch_effective_ratio=0.2,
-        nufft_im_size: tuple = (320, 320),
-        epsilon: float = 1e-2,
-        iterations: int = 5,
-        gamma_init=0.1,
-        tau_init=0.2,
-    ):
-        super().__init__()
-        self.physics = MR_Forward_Model(
-            patch_size, nufft_im_size, CSM_FixPh, LinearPhysics, NUFFT
-        )
-        self.prior = deepinv.optim.TVPrior()
-        self.data_fidelity = deepinv.optim.data_fidelity.L2()
-        self.model = deepinv.optim.optim_builder(
-            iteration="GD",
-            max_iter=iterations,
-            prior=self.prior,
-            data_fidelity=self.data_fidelity,
-            params_algo={"stepsize": gamma_init, "lambda": tau_init},
+class ComplexRED(Prior):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.denoiser = ComplexUnet(
+            in_channels=1,
+            out_channels=1,
+            spatial_dims=3,
+            conv_net=DWUNet(
+                in_channels=2,
+                out_channels=2,
+                spatial_dims=3,
+                strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
+                kernel_sizes=(
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                ),
+                features=(16, 32, 64, 128, 256),
+            ),
+            norm_with_given_std=True,
         )
 
-        self.epsilon = epsilon
+    def grad(self, x, sigma_denoiser):
+        return x - self.denoiser(x.unsqueeze(1), std=1).squeeze(1)
+
+
+class fStep_FP_RED(fStep):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def forward(self, x, cur_data_fidelity, cur_params, y, physics):
+        # return x - cur_params["stepsize"] * physics.A_dagger(y, x_init=x, rtol=1e-2)
+        # return physics.A_dagger(y, x_init=x, rtol=1e-2)
+        return physics.prox_l2(x, y, cur_params["stepsize"])
+
+
+class gStep_FP_RED(gStep):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def forward(self, x, cur_prior, cur_params):
+        grad = cur_params["lambda"] * cur_prior.grad(x, cur_params["g_param"])
+        return x - grad
+
+
+class MOTIF_FP_RED(OptimIterator):
+    def __init__(
+        self,
+        physics: LinearPhysics = MR_Forward_Model(
+            # Repeat("b d h w -> b ph d h w", dict(ph=5)),
+            MVF_Dyn((80, 320, 320), (1, 4, 4)),
+            CSM_FixPh(None),
+            NUFFT_2D_FFT_1D((320, 320)),
+            KspaceMask_kz(),
+        ),
+        iterations: int = 5,
+        stepsize=1.0,
+        lambda_=0.2,
+    ):
+        super().__init__()
+        self.physics = physics
+        self.prior = ComplexRED()
+        self.data_fidelity = deepinv.optim.data_fidelity.L2()
+        self.g_step = gStep_FP_RED()
+        self.f_step = fStep_FP_RED()
+        self.cur_params = {
+            "stepsize": 1.0,
+            "lambda": lambda_,
+            "g_param": None,
+        }
         self.iterations = iterations
 
     def forward(
         self,
         kspace_data,
         kspace_traj,
-        image_init,
+        kspace_mask,
         mvf,
         csm,
-        std,
-        weights_flag=True,
+        image_init=None,
+        iterations=None,
+        stepsize=None,
+        lambda_=None,
     ):
-        # initialization
-        # from monai.visualize import matshow3d
-        # matshow3d(
-        #     image_init[0, 0, 0:5].abs().cpu().numpy(), cmap="gray", vmin=0, vmax=5
-        # )
-        # plt.imshow(image_init[0, 0, 40])
-        image_init = torch.nan_to_num_(image_init)
-        self.ph_num = kspace_data.shape[1]
-        image_list = []
-        if torch.is_complex(image_init):
-            x = image_init
-        else:
-            x = torch.complex(image_init, torch.zeros_like(image_init))
-        image_list.append(image_init.cpu())
-
-        self.forward_model.generate_forward_operators(mvf, csm, kspace_traj)
-
-        x.requires_grad_(True)
-        # ic(self.tau)
-        # TODO Don know why, but gradient become nan after first iteration.
-
-        # grad_dc_fn = grad(lambda img: self.inner_loss(img, kspace_data))
-        # print(std)
-        for t in range(self.iterations):
-            print("iteration", t, "start")
-            # apply forward model to get kspace_data_estimated
-            # ic(t, x[0, 0, 0, 0, 0:10])
-            # with torch.autograd.detect_anomaly():
-            # ic(x[0, 0, 0, 0, 0:10])
-            dc_loss = self.inner_loss(x.clone(), kspace_data, weights_flag)
-            grad_dc = torch.autograd.grad(dc_loss, x)[0]
-            grad_reg = torch.zeros_like(x, dtype=torch.complex64)
-            grad_reg[:, :, self.effective_slice] = x[
-                :, :, self.effective_slice
-            ] - self.regularization(x[:, :, self.effective_slice], std=std)
-            updates = -(self.gamma * grad_dc + self.tau[t] * grad_reg)
-            # updates = -self.gamma * grad_dc
-            x = x.add(updates)
-            # ic("after add", x[0, 0, 0, 0, 0:10])
-            image_list.append(x.clone().detach().cpu())
-            print(f"t: {t}, loss: {dc_loss}")
-
-        return x, image_list
-
-    def image_init(self, image_multi_ch, csm):
-        image_init = torch.sum(image_multi_ch * csm.conj(), dim=2)
-        return image_init
-
-    def inner_loss(self, x, kspace_data, weights_flag):
-        # ic(x[0, 0, 0, 0, 0:10])
-        kspace_data_estimated = self.forward_model(x)
-        # ic(kspace_data_estimated[0, 0, 0, 0, 0:10])
-        if weights_flag:
-            kspace_data_estimated_detatched = (
-                kspace_data_estimated[:, :, :, self.effective_slice].detach().abs()
-            )
-            norm_factor = kspace_data_estimated_detatched.max()
-            weights = 1 / (kspace_data_estimated_detatched / norm_factor + self.epsilon)
-        else:
-            weights = 1
-
-        # ic(diff[0, 0, 0, 0, 0:10])
-        loss_dc = self.loss_fn(
-            torch.view_as_real(
-                weights * kspace_data_estimated[:, :, :, self.effective_slice]
-            ),
-            torch.view_as_real(weights * kspace_data[:, :, :, self.effective_slice]),
+        self.cur_params["stepsize"] = (
+            stepsize if stepsize is not None else self.cur_params["stepsize"]
         )
-        return loss_dc
+        self.cur_params["lambda"] = (
+            lambda_ if lambda_ is not None else self.cur_params["lambda"]
+        )
+        t = iterations if iterations is not None else self.iterations
+
+        self.physics.update_parameters(
+            mvf_kernels=mvf,
+            csm_kernels=csm,
+            kspace_traj=kspace_traj,
+            kspace_mask=kspace_mask,
+        )
+        y = kspace_data
+        x = self.physics.A_dagger(y, rtol=1e-2) if image_init is None else image_init
+        x_list = [x.detach().clone()]
+        for _ in range(t):
+            x = self.g_step(x, self.prior, self.cur_params)
+            x = self.f_step(x, self.data_fidelity, self.cur_params, y, self.physics)
+            x_list.append(x.detach().clone())
+
+        return x, x_list

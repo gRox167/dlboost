@@ -89,9 +89,7 @@ class ComplexUnet(nn.Module):
         if self.norm_with_given_std:
             x = x / std
         else:
-            mean, std = complex_normalize_abs_95_v(
-                x
-            )  # x will be of shape (B,C*2,H,W)
+            mean, std = complex_normalize_abs_95_v(x)  # x will be of shape (B,C*2,H,W)
             x = x / std
 
         x = torch.view_as_real(x)
@@ -105,9 +103,7 @@ class ComplexUnet(nn.Module):
         x, pad_sizes = divisible_pad_t(x, self.pad_factor)
         x = self.unet(x)
         x = inverse_divisible_pad_t(x, pad_sizes)
-        x = reshape_channel_complex_to_last_dim(
-            x
-        )  # x will be of shape (B,C,H,W,2)
+        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
         x = torch.view_as_complex(x.contiguous())
         # if self.norm_with_given_std:
         #     x = x * std
@@ -170,9 +166,7 @@ class ComplexUnet_norm(nn.Module):
         """
         # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
         # print(x.shape)
-        x, mean, std = complex_normalize_abs_95_v(
-            x
-        )  # x will be of shape (B,C*2,H,W)
+        x, mean, std = complex_normalize_abs_95_v(x)  # x will be of shape (B,C*2,H,W)
 
         x = torch.view_as_real(x)
 
@@ -180,9 +174,7 @@ class ComplexUnet_norm(nn.Module):
         # x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
 
         x = self.unet(x)
-        x = reshape_channel_complex_to_last_dim(
-            x
-        )  # x will be of shape (B,C,H,W,2)
+        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
         x = torch.view_as_complex(x.contiguous())
         x = x * std + mean
         return x

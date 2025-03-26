@@ -10,7 +10,7 @@ from typing import (
     Union,
 )
 
-import einops as eo
+import einx
 import torch
 from jaxtyping import PyTree
 from optree import tree_map, tree_structure, tree_transpose
@@ -22,35 +22,20 @@ from xarray import DataArray
 
 
 def complex_as_real_2ch(x):
-    # breakpoint()
-    if len(x.shape) == 4:
-        return eo.rearrange(torch.view_as_real(x), "b c h w cmplx-> b (c cmplx) h w")
-    elif len(x.shape) == 5:
-        return eo.rearrange(
-            torch.view_as_real(x), "b c d h w cmplx-> b (c cmplx) d h w"
-        )
+    return einx.rearrange("b ch ... cmplx-> b (ch cmplx) ...", torch.view_as_real(x))
 
 
-def real_2ch_as_complex(x, c=1):
-    if len(x.shape) == 4:
-        return torch.view_as_complex(
-            eo.rearrange(
-                x, "b (c cmplx) h w -> b c h w cmplx", c=c, cmplx=2
-            ).contiguous()
-        )
-    elif len(x.shape) == 5:
-        return torch.view_as_complex(
-            eo.rearrange(
-                x, "b (c cmplx) d h w -> b c d h w cmplx", c=c, cmplx=2
-            ).contiguous()
-        )
+def real_2ch_as_complex(x, ch=1):
+    return torch.view_as_complex(
+        einx.rearrange("b (ch cmplx) ... -> b ch ... cmplx", x, ch=ch, cmplx=2).contiguous()
+    )
 
 
-def complex_as_real_ch(func):
-    def wrapper(x):
-        x = complex_as_real_2ch(x)
-        x = func(x)
-        x = real_2ch_as_complex(x)
+def complex_as_real_ch(func, ch=1):
+    def wrapper(*args, **kwargs):
+        _args = tree_map(complex_as_real_2ch, args)
+        x = func(*_args, **kwargs)
+        x = real_2ch_as_complex(x, ch=ch)
         return x
 
     return wrapper
