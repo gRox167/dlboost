@@ -3,6 +3,7 @@ from typing import Dict, Tuple
 import einx
 import numpy as np
 import torch
+from deepinv.optim.utils import least_squares
 from deepinv.physics import LinearPhysics, adjoint_function
 from dlboost.models import SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
@@ -19,7 +20,7 @@ from mrboost.computation import (
     radial_spokes_to_kspace_point,
 )
 from mrboost.type_utils import ComplexImage3D, KspaceSpokesData, KspaceSpokesTraj
-from torchopt.linear_solve import solve_cg, solve_normal_cg
+from torchopt.linear_solve import solve_cg
 
 
 class CSM(LinearPhysics):
@@ -356,20 +357,16 @@ class RadialVibePhysics(LinearPhysics):
         kspace_mask: Shaped[KspaceSpokesData, "b ch kz"] | None = None,
         nufft_im_size: tuple[int, int] | None = None,
     ):
-        if ktraj is not None:
-            self.ktraj = ktraj  # (b, 2, sp, len)
+        if ktraj is not None or nufft_im_size is not None:
             self.nufft_operator.update_parameters(ktraj, nufft_im_size)
 
         if csm is not None:
-            self.csm = csm
             self.csm_operator.update_parameters(csm)
 
         if kspace_mask is not None:
             self.kspace_mask_operator.update_parameters(kspace_mask)
 
-    def A(
-        self, x: Shaped[ComplexImage3D, "b d h w"]
-    ) -> Shaped[KspaceSpokesData, "b ch kz"]:
+    def A(self, x: Shaped[ComplexImage3D, "b"]) -> Shaped[KspaceSpokesData, "b ch kz"]:
         # Apply coil sensitivity operator
         x_coils = self.csm_operator.A(x)
 
@@ -383,26 +380,30 @@ class RadialVibePhysics(LinearPhysics):
 
     def A_adjoint(
         self, y: Shaped[KspaceSpokesData, "b ch kz"]
-    ) -> Shaped[ComplexImage3D, "b d h w"]:
+    ) -> Shaped[ComplexImage3D, "b"]:
+        # Apply adjoint of kspace mask operator
+        y_masked = self.kspace_mask_operator.A_adjoint(y)
+
         # Apply adjoint of NUFFT and 1D FFT
-        image_coils = self.nufft_operator.A_adjoint(y)
+        image_coils = self.nufft_operator.A_adjoint(y_masked)
 
         # Apply adjoint of coil sensitivity operator
         image = self.csm_operator.A_adjoint(image_coils)
 
-        # Apply adjoint of kspace mask operator
-        image = self.kspace_mask_operator.A_adjoint(image)
-
         return image
 
     def A_dagger(self, y, x_init=None, **kwargs):
-        # if x_init in kwargs, use it as the initial guess
-        if x_init is not None:
-            init = x_init
-        else:
-            init = self.A_adjoint(y)
-        solver = solve_normal_cg(init=init, **kwargs)
-        x_hat = solver(self.A, y)
+        with torch.no_grad():
+            # if x_init in kwargs, use it as the initial guess
+            if x_init is not None:
+                init = x_init
+            else:
+                init = self.A_adjoint(y)
+            x_hat = least_squares(
+                self.A, self.A_adjoint, y, init=init, tol=1e-3, **kwargs
+            )
+            # solver = solve_normal_cg(init=init, **kwargs)
+            # x_hat = solver(self.A, y)
         return x_hat
 
 

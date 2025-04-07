@@ -1,5 +1,6 @@
 import deepinv as dinv
 import torch
+from icecream import ic
 
 
 class UNSURE(dinv.loss.Loss):
@@ -13,6 +14,7 @@ class UNSURE(dinv.loss.Loss):
         kernel_size=1,
         momentum=0.9,
         pseudo_inverse=True,
+        dimension=3,
         device="cpu",
     ):
         r"""
@@ -36,11 +38,23 @@ class UNSURE(dinv.loss.Loss):
 
         # initialise Lagrange multipliers
         if mode == "gaussian" or mode == "poisson_gaussian":
-            self.sigma = torch.ones((1, 1, kernel_size, kernel_size), device=device)
+            self.sigma = (
+                torch.ones((1, 1, kernel_size, kernel_size), device=device)
+                if dimension == 2
+                else torch.ones(
+                    (1, 1, kernel_size, kernel_size, kernel_size), device=device
+                )
+            )
             self.sigma = self.sigma / self.sigma.sum() * sigma_init
             self.sigma.requires_grad = True
         if mode == "poisson" or mode == "poisson_gaussian":
-            self.gain = torch.ones((1, 1, kernel_size, kernel_size), device=device)
+            self.gain = (
+                torch.ones((1, 1, kernel_size, kernel_size), device=device)
+                if dimension == 2
+                else torch.ones(
+                    (1, 1, kernel_size, kernel_size, kernel_size), device=device
+                )
+            )
             self.gain = self.gain / self.gain.sum() * gain_init
             self.gain.requires_grad = True
 
@@ -51,6 +65,7 @@ class UNSURE(dinv.loss.Loss):
         self.momentum = momentum
         self.init_flag = True
         self.pinv = pseudo_inverse
+        self.dimension = dimension
 
     def forward(self, y, x_net, physics, model, **kwargs):
         y1 = physics.A(x_net)
@@ -65,8 +80,14 @@ class UNSURE(dinv.loss.Loss):
             gain = 0.0
 
         if self.kernel_size > 1:
-            b = dinv.physics.functional.conv2d(
-                b, (self.sigma + gain), padding="circular"
+            b = (
+                dinv.physics.functional.conv2d(
+                    b, (self.sigma + gain), padding="circular"
+                )
+                if self.dimension == 2
+                else dinv.physics.functional.conv3d(
+                    b, (self.sigma + gain), padding="circular"
+                )
             )
         else:
             b *= self.sigma + gain
@@ -77,6 +98,8 @@ class UNSURE(dinv.loss.Loss):
             diff = physics.A_dagger(b) * physics.A_dagger(y2 - y1) / self.tau
         else:
             diff = (b * (y2 - y1)) / self.tau
+        if torch.is_complex(diff):
+            diff = torch.view_as_real(diff)
         div = 2 * diff.reshape(y.size(0), -1).mean(1)
 
         if self.mode == "gaussian" or self.mode == "poisson_gaussian":
@@ -87,7 +110,15 @@ class UNSURE(dinv.loss.Loss):
         if self.pinv:
             residual = physics.A_dagger(y1 - y).pow(2).reshape(y.size(0), -1).mean(1)
         else:
-            residual = (y1 - y).pow(2).reshape(y.size(0), -1).mean(1)
+            if torch.is_complex(y1):
+                residual = (
+                    (torch.view_as_real(y1 - y)).pow(2).reshape(y.size(0), -1).mean(1)
+                )
+            else:
+                residual = (y1 - y).pow(2).reshape(y.size(0), -1).mean(1)
+
+        ic(residual)
+        ic(div)
 
         loss = div + residual
         return loss
