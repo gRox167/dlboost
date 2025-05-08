@@ -1,16 +1,12 @@
-__all__ = ["DWUNet", "DWUNet_P2PCSE"]
-from math import prod
-
 # from torch.nn import functional as F
 from typing import Optional, Sequence
 
 import torch
 
+# from deepspeed.runtime.activation_checkpointing.checkpointing import checkpoint
 # from monai.utils import ensure_tuple_rep
-from einops.layers.torch import Rearrange
 from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from torch import nn
-from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
 # from dlboost.models.BasicUNet import Down
 
@@ -28,8 +24,11 @@ class DWInvertedBlock(nn.Module):
         act_name: tuple | str,
         dropout: tuple | str | float | None = None,
         layer_scale_init_value=1e-6,
-        mlp_ratio=4.0,
+        mlp_ratio=2.0,
         padding=5,
+        checkpointing=False,
+        *args,
+        **kwargs,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -42,6 +41,8 @@ class DWInvertedBlock(nn.Module):
             self.shortcut_conv = conv(
                 in_channels, out_channels, kernel_size=1, stride=stride, bias=True
             )
+        else:
+            self.shortcut_conv = nn.Identity()
         self.pwconv1 = conv(
             in_channels, int(mlp_ratio * out_channels), kernel_size=1, bias=True
         )  # pointwise/1x1 convs, implemented with linear layers
@@ -64,6 +65,7 @@ class DWInvertedBlock(nn.Module):
         self.pwconv2 = conv(
             int(mlp_ratio * out_channels), out_channels, kernel_size=1, bias=True
         )
+        self.checkpointing = checkpointing
         # self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim)) if layer_scale_init_value > 0 else None
         # self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         # self.downsample = downsample
@@ -76,9 +78,7 @@ class DWInvertedBlock(nn.Module):
         x = self.act1(x)
         x = self.conv_dw(x)
         x = self.pwconv2(x)
-        if self.in_channels != self.out_channels:
-            shortcut = self.shortcut_conv(shortcut)
-        x = x + shortcut
+        x = x + self.shortcut_conv(shortcut)
         return x
 
 
@@ -94,8 +94,11 @@ class DWInvertedDownStage(nn.Module):
         act_name: tuple | str,
         dropout: tuple | str | float | None = None,
         blocks_num: int = 2,
+        checkpointing: bool = False,
+        **kwargs,
     ):
         super().__init__()
+        self.checkpointing = checkpointing
         self.blocks = nn.ModuleList()
         if spatial_dims == 2:
             self.downsample = nn.AvgPool2d(stride)
@@ -112,6 +115,7 @@ class DWInvertedDownStage(nn.Module):
                 norm_name,
                 act_name,
                 dropout,
+                checkpointing=self.checkpointing,
             )
         )
         for _ in range(blocks_num - 1):
@@ -125,6 +129,7 @@ class DWInvertedDownStage(nn.Module):
                     norm_name,
                     act_name,
                     dropout,
+                    checkpointing=self.checkpointing,
                 )
             )
         self.blocks = nn.Sequential(*blocks)
@@ -147,8 +152,11 @@ class DWInvertedUpStage(nn.Module):
         act_name: tuple | str,
         dropout: tuple | str | float | None = None,
         blocks_num: int = 2,
+        checkpointing: bool = False,
+        **kwargs,
     ):
         super().__init__()
+        self.checkpointing = checkpointing
         if spatial_dims == 2:
             self.upsample = nn.Upsample(
                 scale_factor=upsample_factors, mode="bilinear", align_corners=True
@@ -169,6 +177,7 @@ class DWInvertedUpStage(nn.Module):
                 norm_name,
                 act_name,
                 dropout,
+                checkpointing=checkpointing,
             )
         ]
         for _ in range(blocks_num - 1):
@@ -182,6 +191,7 @@ class DWInvertedUpStage(nn.Module):
                     norm_name,
                     act_name,
                     dropout,
+                    checkpointing=checkpointing,
                 )
             )
         self.blocks = nn.Sequential(*blocks)
@@ -192,37 +202,6 @@ class DWInvertedUpStage(nn.Module):
         x = self.blocks(
             torch.cat([x_e, x_0], dim=1)
         )  # input channels: (cat_chns + up_chns)
-        return x
-
-
-class DWInvertedPatchExpand(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        cat_channels: int,
-        expand_ratio,
-    ):
-        super().__init__()
-        self.expand = nn.Conv3d(
-            in_channels, out_channels * prod(expand_ratio), kernel_size=1
-        )
-        self.shuffle = Rearrange(
-            "b (c p1 p2 p3) d h w-> b c (d p1) (h p2) (w p3)",
-            p1=expand_ratio[0],
-            p2=expand_ratio[1],
-            p3=expand_ratio[2],
-        )
-        self.contract = nn.Conv3d(
-            out_channels + cat_channels, out_channels, kernel_size=1
-        )
-        # self.expand = nn.Conv3d(in_channels, out_channels * prod(expand_ratio), kernel_size=1)
-        # self.shuffle = Rearrange('b (c p1 p2 p3) d h w-> b c (d p1) (h p2) (w p3)', p1=expand_ratio[0], p2=expand_ratio[1], p3=expand_ratio[2])
-
-    def forward(self, x, x0):
-        x = self.expand(x)
-        x = self.shuffle(x)
-        x = self.contract(torch.cat([x, x0], dim=1))
         return x
 
 
@@ -401,30 +380,51 @@ class DWUNet(nn.Module):
         spatial_dims: int = 3,
         in_channels: int = 1,
         out_channels: int = 2,
-        strides=((1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)),
-        kernel_sizes=((1, 7, 7), (1, 7, 7), (1, 7, 7), (1, 7, 7), (1, 7, 7)),
+        strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
+        kernel_sizes=((3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3)),
         features: Sequence[int] = (32, 64, 128, 256, 512),
         # stages = (2,2,2,2),
         act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
         norm: str | tuple = ("instance", {"affine": True}),
         dropout: float | tuple = 0.0,
+        checkpointing: bool = False,
     ):
         super().__init__()
-        # fea = ensure_tuple_rep(features, 6)
-        # print(f"BasicUNet features: {fea}.")
-        # features = [in_channels*prod(stem_patch_size)*(2**i) for i in range(5)]
-        # self.stem = Rearrange('b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w', p1=stem_patch_size[0], p2=stem_patch_size[1], p3=stem_patch_size[2])
 
         self.conv_0 = nn.Sequential(
             *[
                 DWInvertedBlock(
-                    spatial_dims, in_channels, features[0], 3, 1, norm, act, dropout
+                    spatial_dims,
+                    in_channels,
+                    features[0],
+                    3,
+                    1,
+                    norm,
+                    act,
+                    dropout,
+                    checkpointing=checkpointing,
                 ),
                 DWInvertedBlock(
-                    spatial_dims, features[0], features[0], 3, 1, norm, act, dropout
+                    spatial_dims,
+                    features[0],
+                    features[0],
+                    3,
+                    1,
+                    norm,
+                    act,
+                    dropout,
+                    checkpointing=checkpointing,
                 ),
                 DWInvertedBlock(
-                    spatial_dims, features[0], features[0], 3, 1, norm, act, dropout
+                    spatial_dims,
+                    features[0],
+                    features[0],
+                    3,
+                    1,
+                    norm,
+                    act,
+                    dropout,
+                    checkpointing=checkpointing,
                 ),
             ]
         )
@@ -439,6 +439,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.down_2 = DWInvertedDownStage(
             spatial_dims,
@@ -450,6 +451,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.down_3 = DWInvertedDownStage(
             spatial_dims,
@@ -461,6 +463,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.down_4 = DWInvertedDownStage(
             spatial_dims,
@@ -472,6 +475,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
 
         self.upcat_4 = DWInvertedUpStage(
@@ -485,6 +489,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.upcat_3 = DWInvertedUpStage(
             spatial_dims,
@@ -497,6 +502,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.upcat_2 = DWInvertedUpStage(
             spatial_dims,
@@ -509,6 +515,7 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.upcat_1 = DWInvertedUpStage(
             spatial_dims,
@@ -521,24 +528,48 @@ class DWUNet(nn.Module):
             act,
             dropout,
             blocks_num=2,
+            checkpointing=checkpointing,
         )
         self.final_conv = nn.Sequential(
             *[
                 DWInvertedBlock(
-                    spatial_dims, features[0], features[0], 3, 1, norm, act, dropout
+                    spatial_dims,
+                    features[0],
+                    features[0],
+                    3,
+                    1,
+                    norm,
+                    act,
+                    dropout,
+                    checkpointing=checkpointing,
                 ),
                 DWInvertedBlock(
-                    spatial_dims, features[0], features[0], 3, 1, norm, act, dropout
+                    spatial_dims,
+                    features[0],
+                    features[0],
+                    3,
+                    1,
+                    norm,
+                    act,
+                    dropout,
+                    checkpointing=checkpointing,
                 ),
                 DWInvertedBlock(
-                    spatial_dims, features[0], out_channels, 3, 1, norm, act, dropout
+                    spatial_dims,
+                    features[0],
+                    out_channels,
+                    3,
+                    1,
+                    norm,
+                    act,
+                    dropout,
+                    checkpointing=checkpointing,
                 ),
             ]
         )
-        # self.final_conv = nn.Sequential(*[DWInvertedBlock(spatial_dims, features[0], features[0], 3, 1, norm, act, dropout) for i in range(2)])
-        # self.expand = nn.ConvTranspose3d(features[0], in_channels, kernel_size=stem_patch_size, stride=stem_patch_size)
-        # self.expand = DWInvertedPatchExpand(features[0], in_channels, in_channels, stem_patch_size)
+        self.checkpointing = checkpointing
 
+    @torch.compile()
     def forward(self, x: torch.Tensor):
         """
         Args:
@@ -551,8 +582,21 @@ class DWUNet(nn.Module):
             A torch Tensor of "raw" predictions in shape
             ``(Batch, out_channels, dim_0[, dim_1, ..., dim_N-1])``.
         """
-        # x0 = self.stem(x)
+        # if self.checkpointing:
+        #     with torch.autograd.graph.save_on_cpu(pin_memory=True):
+        #         x0 = self.conv_0(x)
+        #         x1 = self.down_1(x0)
+        #         x2 = self.down_2(x1)
+        #         x3 = self.down_3(x2)
+        #         x4 = self.down_4(x3)
 
+        #         u4 = self.upcat_4(x4, x3)
+        #         u3 = self.upcat_3(u4, x2)
+        #         u2 = self.upcat_2(u3, x1)
+        #         u1 = self.upcat_1(u2, x0)
+
+        #         logits = self.final_conv(u1)
+        # else:
         x0 = self.conv_0(x)
         x1 = self.down_1(x0)
         x2 = self.down_2(x1)
@@ -565,148 +609,17 @@ class DWUNet(nn.Module):
         u1 = self.upcat_1(u2, x0)
 
         logits = self.final_conv(u1)
-        # logits = self.expand(u1, x)
 
         return logits
 
 
-class DWUNet_Checkpointing(nn.Module):
+class DWUNet_Checkpointing(DWUNet):
     def __init__(
         self,
-        spatial_dims: int = 3,
-        in_channels: int = 1,
-        out_channels: int = 2,
-        strides=((1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2)),
-        kernel_sizes=((1, 7, 7), (1, 7, 7), (1, 7, 7), (1, 7, 7), (1, 7, 7)),
-        features: Sequence[int] = (32, 64, 128, 256, 512),
-        # stages = (2,2,2,2),
-        act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
-        norm: str | tuple = ("instance", {"affine": True}),
-        dropout: float | tuple = 0.0,
+        *args,
+        **kwargs,
     ):
-        super().__init__()
-        # fea = ensure_tuple_rep(features, 6)
-        # print(f"BasicUNet features: {fea}.")
-        # features = [in_channels*prod(stem_patch_size)*(2**i) for i in range(5)]
-        # self.stem = Rearrange('b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w', p1=stem_patch_size[0], p2=stem_patch_size[1], p3=stem_patch_size[2])
-
-        self.conv_0 = nn.Sequential(
-            *[
-                DWInvertedBlock(
-                    spatial_dims, in_channels, features[0], 3, 1, norm, act, dropout
-                ),
-                DWInvertedBlock(
-                    spatial_dims, features[0], features[0], 3, 1, norm, act, dropout
-                ),
-            ]
-        )
-
-        self.down_1 = DWInvertedDownStage(
-            spatial_dims,
-            features[0],
-            features[1],
-            kernel_sizes[0],
-            strides[0],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.down_2 = DWInvertedDownStage(
-            spatial_dims,
-            features[1],
-            features[2],
-            kernel_sizes[1],
-            strides[1],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.down_3 = DWInvertedDownStage(
-            spatial_dims,
-            features[2],
-            features[3],
-            kernel_sizes[2],
-            strides[2],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.down_4 = DWInvertedDownStage(
-            spatial_dims,
-            features[3],
-            features[4],
-            kernel_sizes[3],
-            strides[3],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-
-        self.upcat_4 = DWInvertedUpStage(
-            spatial_dims,
-            features[4],
-            features[3],
-            features[3],
-            strides[3],
-            kernel_sizes[3],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.upcat_3 = DWInvertedUpStage(
-            spatial_dims,
-            features[3],
-            features[2],
-            features[2],
-            strides[2],
-            kernel_sizes[2],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.upcat_2 = DWInvertedUpStage(
-            spatial_dims,
-            features[2],
-            features[1],
-            features[1],
-            strides[1],
-            kernel_sizes[1],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.upcat_1 = DWInvertedUpStage(
-            spatial_dims,
-            features[1],
-            features[0],
-            features[0],
-            strides[0],
-            kernel_sizes[0],
-            norm,
-            act,
-            dropout,
-            blocks_num=2,
-        )
-        self.final_conv = nn.Sequential(
-            *[
-                DWInvertedBlock(
-                    spatial_dims, features[0], features[0], 3, 1, norm, act, dropout
-                ),
-                DWInvertedBlock(
-                    spatial_dims, features[0], out_channels, 3, 1, norm, act, dropout
-                ),
-            ]
-        )
-        # self.final_conv = nn.Sequential(*[DWInvertedBlock(spatial_dims, features[0], features[0], 3, 1, norm, act, dropout) for i in range(2)])
-        # self.expand = nn.ConvTranspose3d(features[0], in_channels, kernel_size=stem_patch_size, stride=stem_patch_size)
-        # self.expand = DWInvertedPatchExpand(features[0], in_channels, in_channels, stem_patch_size)
+        super().__init__(*args, **kwargs)
 
     def forward(self, x: torch.Tensor):
         """
@@ -720,25 +633,17 @@ class DWUNet_Checkpointing(nn.Module):
             A torch Tensor of "raw" predictions in shape
             ``(Batch, out_channels, dim_0[, dim_1, ..., dim_N-1])``.
         """
-        x0 = checkpoint_sequential(self.conv_0, 2, x)
-        x1 = checkpoint(self.down_1, x0)
-        x2 = checkpoint(self.down_2, x1)
-        x3 = checkpoint(self.down_3, x2)
-        x4 = checkpoint(self.down_4, x3)
-        # x1 = self.down_1(x0)
-        # x2 = self.down_2(x1)
-        # x3 = self.down_3(x2)
-        # x4 = self.down_4(x3)
+        with torch.autograd.graph.save_on_cpu(pin_memory=True):
+            x0 = self.conv_0(x)
+            x1 = self.down_1(x0)
+            x2 = self.down_2(x1)
+            x3 = self.down_3(x2)
+            x4 = self.down_4(x3)
 
-        u4 = checkpoint(self.upcat_4, x4, x3)
-        u3 = checkpoint(self.upcat_3, u4, x2)
-        u2 = checkpoint(self.upcat_2, u3, x1)
-        u1 = checkpoint(self.upcat_1, u2, x0)
+            u4 = self.upcat_4(x4, x3)
+            u3 = self.upcat_3(u4, x2)
+            u2 = self.upcat_2(u3, x1)
+            u1 = self.upcat_1(u2, x0)
 
-        # u4 = self.upcat_4(x4, x3)
-        # u3 = self.upcat_3(u4, x2)
-        # u2 = self.upcat_2(u3, x1)
-        # u1 = self.upcat_1(u2, x0)
-
-        logits = checkpoint_sequential(self.final_conv, 2, u1)
+            logits = self.final_conv(u1)
         return logits

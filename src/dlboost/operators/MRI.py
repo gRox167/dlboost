@@ -90,10 +90,10 @@ class MVF_Dyn(LinearPhysics):
         # _mvf = einx.rearrange("ph v d h w -> ph v d h w", mvf_kernels)
         if self.scale_factor is not None:
             b, ph, v, d, h, w = mvf_kernels.shape
-            mvf_kernels = einx.rearrange("b ph v z h w -> (b ph) v z h w", mvf_kernels)
+            mvf_kernels = einx.rearrange("b ph v d h w -> (b ph) v d h w", mvf_kernels)
             mvf_kernels = resize_deformation_field(mvf_kernels, self.scale_factor)
             self._mvf = einx.rearrange(
-                "(b ph) v z h w -> b ph v z h w", mvf_kernels, ph=ph
+                "(b ph) v d h w -> b ph v d h w", mvf_kernels, ph=ph
             )
         else:
             self._mvf = mvf_kernels
@@ -105,6 +105,10 @@ class MVF_Dyn(LinearPhysics):
             device=self._mvf.device,
             dtype=torch.complex64,
         )
+        if self.spatial_transform.grid.device != self._mvf.device:
+            self.spatial_transform.grid = self.spatial_transform.grid.to(
+                self._mvf.device
+            )
 
     def A(self, image: Shaped[ComplexImage3D, "b d h w"]):
         image_moving = einx.rearrange(
@@ -131,7 +135,24 @@ class MVF_Dyn(LinearPhysics):
         )
 
     def A_adjoint(self, y, **kwargs):
+        """Calculate adjoint operator using autograd"""
         return self.A_adjoint_func(y, **kwargs)
+        # Create a dummy input with requires_grad=True
+        # batch_size = y.shape[0]
+        # d, h, w = y.shape[2], y.shape[3], y.shape[4]
+        # x = torch.zeros(
+        #     batch_size, d, h, w, dtype=y.dtype, device=y.device, requires_grad=True
+        # )
+
+        # # Apply the forward operator
+        # Ax = self.A(x)
+
+        # # Compute gradient of inner product with respect to x
+        # grad = torch.autograd.grad(
+        #     Ax, x, create_graph=kwargs.get("create_graph", True)
+        # )[0]
+
+        # return grad
 
 
 class Repeat(LinearPhysics):
@@ -221,6 +242,7 @@ class NUFFT_2D_FFT_1D(LinearPhysics):
             self.nufft_im_size = nufft_im_size
         if kspace_traj is not None:
             self.spoke_len = kspace_traj.shape[-1]
+            self.kspace_spoke_traj = kspace_traj
             self.kspace_traj = radial_spokes_to_kspace_point(kspace_traj)
 
     def A(
@@ -244,6 +266,7 @@ class NUFFT_2D_FFT_1D(LinearPhysics):
     ) -> Shaped[ComplexImage3D, "*b ch"]:
         kspace_data = radial_spokes_to_kspace_point(kspace_data)
         _kxkyz = ifft_1D(kspace_data, dim=-2)
+
         return nufft_adj_2d(
             _kxkyz,
             self.kspace_traj,

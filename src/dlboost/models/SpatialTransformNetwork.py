@@ -39,13 +39,15 @@ class SpatialTransformNetwork(nn.Module):
         elif len(shape) == 3:
             new_locs = new_locs.permute(0, 2, 3, 4, 1)
             new_locs = new_locs[..., [2, 1, 0]]
-
-        if return_phi:
-            return F.grid_sample(
-                src, new_locs, align_corners=True, mode=self.mode
-            ), new_locs
-        else:
-            return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
+        with torch.amp.autocast("cuda", enabled=False):
+            new_locs = new_locs.float()
+            src = src.float()
+            if return_phi:
+                return F.grid_sample(
+                    src, new_locs, align_corners=True, mode=self.mode
+                ), new_locs
+            else:
+                return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
 
 
 class VecInt(nn.Module):

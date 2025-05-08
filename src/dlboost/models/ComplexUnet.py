@@ -32,27 +32,27 @@ class ComplexUnet(nn.Module):
         out_channels: int = 3,
         spatial_dims: int = 2,
         features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = (
-            "LeakyReLU",
-            {"negative_slope": 0.1, "inplace": True},
-        ),
+        act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
         norm: str | tuple = ("instance", {"affine": True}),
         bias: bool = True,
         dropout: float | tuple = 0.0,
         upsample: str = "nontrainable",
         pad_factor: int = 16,
         conv_net: nn.Module | None = None,
-        input_append_channel=0,
-        norm_with_given_std=False,
+        input_append_channel: int = 0,
+        norm_with_given_std: bool = False,
+        residual_wrapper: bool = False,
     ):
         super().__init__()
-        self.unet: nn.Module
         self.in_channels = in_channels
         self.input_append_channel = input_append_channel
+        self.norm_with_given_std = norm_with_given_std
+        self.pad_factor = pad_factor
+        self.residual_wrapper = residual_wrapper
         if conv_net is None:
             self.unet = BasicUNet(
                 spatial_dims=spatial_dims,
-                in_channels=2 * in_channels + self.input_append_channel,
+                in_channels=2 * in_channels + input_append_channel,
                 out_channels=2 * out_channels,
                 features=features,
                 act=act,
@@ -62,165 +62,75 @@ class ComplexUnet(nn.Module):
                 upsample=upsample,
             )
         else:
-            # assume the first layer is convolutional and
-            # check whether in_channels == 2
-            # params = [p.shape for p in conv_net.parameters()]
-            # if params[0][1] != 2:
-            #     raise ValueError(f"in_channels should be 2 but it's {params[0][1]}.")
             self.unet = conv_net
-        self.norm_with_given_std = norm_with_given_std
-        self.pad_factor = pad_factor
 
     def forward(
         self,
         x: Tensor,
+        std: Tensor | float = 1.0,
         input_append_channel: Tensor | None = None,
-        std: Tensor | float = None,
     ) -> Tensor:
         """
+        Process complex tensor through UNet architecture.
+
         Args:
-            x: input of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
+            x: Complex input of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
+            std: Standard deviation for normalization, either provided or calculated
+            input_append_channel: Optional additional channel to append to input
 
         Returns:
-            output of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
+            Complex tensor of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
         """
-        # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
-        # print(x.shape)
-        if self.norm_with_given_std:
-            x = x / std
-        else:
-            mean, std = complex_normalize_abs_95_v(x)  # x will be of shape (B,C*2,H,W)
-            x = x / std
 
-        x = torch.view_as_real(x)
+        # input_device = x.device
+        # model_device = next(self.unet.parameters()).device
+        # if input_device != model_device:
+        #     x.to(model_device)
 
-        x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
+        # Normalize input
+        if not self.norm_with_given_std:
+            _, std = complex_normalize_abs_95_v(x)
+        x = x / std
+
+        # Convert to real representation and prepare for UNet
+        x = reshape_complex_to_channel_dim(torch.view_as_real(x))
+
+        # Append additional channels if provided
         if input_append_channel is not None:
             x = einx.rearrange(
                 "b c1 ..., b c2 ... -> b (c1+c2) ...", x, input_append_channel
             )
 
+        # Process through UNet with padding
         x, pad_sizes = divisible_pad_t(x, self.pad_factor)
-        x = self.unet(x)
+        if self.residual_wrapper:
+            input_tensor = (
+                x[:, : -input_append_channel.shape[1]]
+                if input_append_channel is not None
+                else x
+            )
+            x = input_tensor + self.unet(x)
+        else:
+            x = self.unet(x)
         x = inverse_divisible_pad_t(x, pad_sizes)
-        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
-        x = torch.view_as_complex(x.contiguous())
-        # if self.norm_with_given_std:
-        #     x = x * std
-        # else:
+
+        # Convert back to complex representation
+        x = torch.view_as_complex(
+            reshape_channel_complex_to_last_dim(x).contiguous().to(dtype=torch.float32)
+        )
+
+        # Apply denormalization
         x *= std
-        # x = x * std + mean
         return x
 
 
-class ComplexUnet_norm(nn.Module):
+class ComplexUnetDenoiser(ComplexUnet):
     def __init__(
         self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        spatial_dims: int = 2,
-        features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = (
-            "LeakyReLU",
-            {"negative_slope": 0.1, "inplace": True},
-        ),
-        norm: str | tuple = ("instance", {"affine": True}),
-        bias: bool = True,
-        dropout: float | tuple = 0.0,
-        upsample: str = "nontrainable",
-        pad_factor: int = 16,
-        conv_net: nn.Module | None = None,
+        *args,
+        **kwargs,
     ):
-        super().__init__()
-        self.unet: nn.Module
-        self.in_channels = in_channels
-        if conv_net is None:
-            self.unet = BasicUNet(
-                spatial_dims=spatial_dims,
-                in_channels=2 * in_channels,
-                out_channels=2 * out_channels,
-                features=features,
-                act=act,
-                norm=norm,
-                bias=bias,
-                dropout=dropout,
-                upsample=upsample,
-            )
-        else:
-            # assume the first layer is convolutional and
-            # check whether in_channels == 2
-            # params = [p.shape for p in conv_net.parameters()]
-            # if params[0][1] != 2:
-            #     raise ValueError(f"in_channels should be 2 but it's {params[0][1]}.")
-            self.unet = conv_net
-
-        self.pad_factor = pad_factor
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: input of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
-
-        Returns:
-            output of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
-        """
-        # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
-        # print(x.shape)
-        x, mean, std = complex_normalize_abs_95_v(x)  # x will be of shape (B,C*2,H,W)
-
-        x = torch.view_as_real(x)
-
-        x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
-        # x, mean, std = complex_normalize(x)  # x will be of shape (B,C*2,H,W)
-
-        x = self.unet(x)
-        x = reshape_channel_complex_to_last_dim(x)  # x will be of shape (B,C,H,W,2)
-        x = torch.view_as_complex(x.contiguous())
-        x = x * std + mean
-        return x
-
-
-class ComplexUnetDenoiser(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        spatial_dims: int = 2,
-        features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = (
-            "LeakyReLU",
-            {"negative_slope": 0.1, "inplace": True},
-        ),
-        norm: str | tuple = ("instance", {"affine": True}),
-        bias: bool = True,
-        dropout: float | tuple = 0.0,
-        upsample: str = "deconv",
-        pad_factor: int = 16,
-        conv_net: nn.Module | None = None,
-    ):
-        super().__init__()
-        self.unet: nn.Module
-        if conv_net is None:
-            self.unet = BasicUNet(
-                spatial_dims=spatial_dims,
-                in_channels=2 * in_channels,
-                out_channels=2 * out_channels,
-                features=features,
-                act=act,
-                norm=norm,
-                bias=bias,
-                dropout=dropout,
-                upsample=upsample,
-            )
-        else:
-            # assume the first layer is convolutional and
-            # check whether in_channels == 2
-            # params = [p.shape for p in conv_net.parameters()]
-            # if params[0][1] != 2:
-            #     raise ValueError(f"in_channels should be 2 but it's {params[0][1]}.")
-            self.unet = conv_net
-
-        self.pad_factor = pad_factor
+        super().__init__(*args, **kwargs)
 
     def forward(self, x: Tensor) -> Tensor:
         """

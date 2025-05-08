@@ -1,20 +1,26 @@
-import deepinv
-import torch
-from deepinv.optim import RED, OptimIterator, Prior
-from deepinv.optim.optimizers import fStep, gStep
-from deepinv.physics import LinearPhysics
-from torch import nn
-from torchopt.linear_solve import solve_cg, solve_normal_cg
+from types import MethodType
 
-from dlboost.models import ComplexUnet, DWUNet
+import deepinv as dinv
+import torch
+from deepinv.optim.data_fidelity import L2
+from deepinv.optim.optimizers import create_iterator
+from deepinv.physics import LinearPhysics
+from deepinv.unfolded import BaseUnfold
+from mrboost.density_compensation.area_based_radial import (
+    area_based_radial_density_compensation,
+)
+
+from dlboost.iterators.gradient_descent import GDIteration
+from dlboost.loss.weightedL2 import WeightedL2Distance
+from dlboost.models import ComplexUnet, DWUNetSmall
 from dlboost.operators.MRI import (
     NUFFT,
-    NUFFT_2D_FFT_1D,
     CSM_FixPh,
-    KspaceMask_kz,
     MVF_Dyn,
     Repeat,
 )
+from dlboost.priors.pnp import PnP
+from dlboost.priors.red import RED
 
 
 class MR_Forward_Model(LinearPhysics):
@@ -24,8 +30,12 @@ class MR_Forward_Model(LinearPhysics):
         CSM_physics=CSM_FixPh((1, 8, 8)),
         NUFFT_physics=NUFFT((320, 320)),
         KspaceMask_physics=None,
+        max_iter=100,
+        tol=1e-2,
+        device=torch.device("cuda:0"),
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.M = MVF_physics
         self.S = CSM_physics
         self.N = NUFFT_physics
@@ -35,76 +45,125 @@ class MR_Forward_Model(LinearPhysics):
             self.MASK = KspaceMask_physics
             self.forward_model = self.MASK * self.N * self.S * self.M
 
+        self.max_iter = max_iter
+        self.tol = tol
+        self.device = device
+        self.weight = None
+
     def update_parameters(
-        self, mvf_kernels=None, csm_kernels=None, kspace_traj=None, kspace_mask=None
+        self,
+        mvf_kernels=None,
+        csm_kernels=None,
+        kspace_traj=None,
+        kspace_mask=None,
+        nufft_im_size=None,
     ):
-        if hasattr(self.M, "update_parameters"):
-            self.M.update_parameters(mvf_kernels)
-        self.S.update_parameters(csm_kernels)
-        self.N.update_parameters(kspace_traj)
-        if hasattr(self, "MASK"):
-            self.MASK.update_parameters(kspace_mask)
+        if hasattr(self.M, "update_parameters") and mvf_kernels is not None:
+            self.M.update_parameters(mvf_kernels.to(self.device))
+        if hasattr(self.S, "update_parameters") and csm_kernels is not None:
+            self.S.update_parameters(csm_kernels.to(self.device))
+        if hasattr(self, "MASK") and kspace_mask is not None:
+            self.MASK.update_parameters(kspace_mask.to(self.device))
+        if hasattr(self.N, "update_parameters") and (
+            nufft_im_size is not None or kspace_traj is not None
+        ):
+            self.N.update_parameters(kspace_traj.to(self.device), nufft_im_size)
 
     def A(self, image):
-        return self.forward_model.A(image)
+        input_device = image.device
+        image = image.to(self.device)
+        return self.forward_model.A(image).to(input_device)
 
     def A_adjoint(self, kspace_data):
-        return self.forward_model.A_adjoint(kspace_data)
+        input_device = kspace_data.device
+        kspace_data = kspace_data.to(self.device)
+        return self.forward_model.A_adjoint(kspace_data).to(input_device)
 
-    def A_dagger(self, y, x_init=None, **kwargs):
-        # if x_init in kwargs, use it as the initial guess
-        if x_init is not None:
-            init = x_init
-        else:
-            init = self.A_adjoint(y)
-        solver = solve_normal_cg(init=init, **kwargs)
-        x_hat = solver(self.A, y)
-        return x_hat
+    def A_A_adjoint(self, y, **kwargs):
+        input_device = y.device
+        y = y.to(self.device)
+        return super().A_A_adjoint(y, **kwargs).to(input_device)
 
-    def prox_l2(self, z, y, gamma, **kwargs):
-        r"""
-        Computes proximal operator of :math:`f(x) = \frac{1}{2}\|Ax-y\|^2`, i.e.,
+    def A_adjoint_A(self, x, **kwargs):
+        input_device = x.device
+        x = x.to(self.device)
+        return super().A_adjoint_A(x, **kwargs).to(input_device)
 
-        .. math::
+    def A_dagger(
+        self, y, solver="CG", max_iter=None, tol=None, verbose=False, **kwargs
+    ):
+        input_device = y.device
+        y = y.to(self.device)
+        return (
+            super()
+            .A_dagger(y, solver, max_iter, tol, verbose, **kwargs)
+            .to(input_device)
+        )
 
-            \underset{x}{\arg\min} \; \frac{\gamma}{2}\|Ax-y\|^2 + \frac{1}{2}\|x-z\|^2
-
-        :param torch.Tensor y: measurements tensor
-        :param torch.Tensor z: signal tensor
-        :param float gamma: hyperparameter of the proximal operator
-        :return: (torch.Tensor) estimated signal tensor
-
-        """
-        b = self.A_adjoint(y) + 1 / gamma * z
-
-        def H(x):
-            return self.A_adjoint(self.A(x)) + 1 / gamma * x
-
-        solver = solve_cg(init=z)
-        x = solver(H, b, rtol=1e-2)
-        return x
-
-
-class Identity_Regularization:
-    def __init__(self):
-        pass
-
-    def __call__(self, params):
-        return params
+    def prox_l2(
+        self, z, y, gamma, solver="CG", max_iter=None, tol=None, verbose=False, **kwargs
+    ):
+        input_device = y.device
+        z = z.to(self.device)
+        y = y.to(self.device)
+        return (
+            super()
+            .prox_l2(z, y, gamma, solver, max_iter, tol, verbose, **kwargs)
+            .to(input_device)
+        )
 
 
-class ComplexRED(Prior):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.denoiser = ComplexUnet(
-            in_channels=1,
-            out_channels=1,
+dwunet = ComplexUnet(
+    1,
+    1,
+    spatial_dims=3,
+    # conv_net=DWUNet(
+    conv_net=DWUNetSmall(
+        in_channels=2,
+        out_channels=2,
+        features=(16, 32, 64, 128, 256),
+        # features=(32, 64, 128, 256, 512),
+        strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)),
+        kernel_sizes=(
+            (3, 3, 3),
+            (3, 3, 3),
+            (3, 3, 3),
+            (3, 3, 3),
+            (3, 3, 3),
+        ),
+    ),
+    input_append_channel=None,
+    norm_with_given_std=True,
+)
+
+
+def custom_init(y, physics):
+    x_init = physics.A_adjoint(y * physics.weight)
+    return {"est": (x_init, torch.zeros_like(x_init))}
+    # return {"est": (torch.zeros_like(x_init), torch.zeros_like(x_init))}
+
+
+class RARE_Phase2Phase_RED(BaseUnfold):
+    def __init__(
+        self,
+        max_iter,
+        params_algo,
+        trainable_params=[],
+        denoiser=ComplexUnet(
+            5,
+            5,
             spatial_dims=3,
-            conv_net=DWUNet(
-                in_channels=2,
-                out_channels=2,
-                spatial_dims=3,
-                strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
+            conv_net=DWUNetSmall(
+                in_channels=10,
+                out_channels=10,
+                features=(
+                    16,
+                    32,
+                    64,
+                    128,
+                    256,
+                ),
+                strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)),
                 kernel_sizes=(
                     (3, 3, 3),
                     (3, 3, 3),
@@ -112,93 +171,179 @@ class ComplexRED(Prior):
                     (3, 3, 3),
                     (3, 3, 3),
                 ),
-                features=(16, 32, 64, 128, 256),
             ),
+            input_append_channel=None,
             norm_with_given_std=True,
+        ),
+    ):
+        data_fidelity = L2()
+        # data_fidelity.d = WeightedL2Distance()
+        # Unrolled optimization algorithm parameters
+        _params_algo = {k: [v] * max_iter for k, v in params_algo.items()}
+        prior = RED(denoiser)
+        # prior = None
+        iterator = create_iterator(
+            GDIteration(line_search=False),
+            prior=prior,
+        )
+        super().__init__(
+            iterator,
+            max_iter=max_iter,
+            trainable_params=trainable_params,
+            has_cost=iterator.has_cost,
+            data_fidelity=data_fidelity,
+            prior=prior,
+            params_algo=_params_algo,
+            custom_init=custom_init,
+            verbose=True,
         )
 
-    def grad(self, x, sigma_denoiser):
-        return x - self.denoiser(x.unsqueeze(1), std=1).squeeze(1)
+    def forward(self, y, physics, x_gt=None, compute_metrics=False, **kwargs):
+        return super().forward(y, physics, x_gt, compute_metrics, **kwargs)
 
 
-class fStep_FP_RED(fStep):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def forward(self, x, cur_data_fidelity, cur_params, y, physics):
-        # return x - cur_params["stepsize"] * physics.A_dagger(y, x_init=x, rtol=1e-2)
-        # return physics.A_dagger(y, x_init=x, rtol=1e-2)
-        return physics.prox_l2(x, y, cur_params["stepsize"])
-
-
-class gStep_FP_RED(gStep):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def forward(self, x, cur_prior, cur_params):
-        grad = cur_params["lambda"] * cur_prior.grad(x, cur_params["g_param"])
-        return x - grad
-
-
-class MOTIF_FP_RED(OptimIterator):
+class SD_RED(BaseUnfold):
     def __init__(
         self,
-        physics: LinearPhysics = MR_Forward_Model(
-            # Repeat("b d h w -> b ph d h w", dict(ph=5)),
-            MVF_Dyn((80, 320, 320), (1, 4, 4)),
-            CSM_FixPh(None),
-            NUFFT_2D_FFT_1D((320, 320)),
-            KspaceMask_kz(),
-        ),
-        iterations: int = 5,
-        stepsize=1.0,
-        lambda_=0.2,
+        max_iter,
+        params_algo,
+        trainable_params=["stepsize", "lambda"],
     ):
-        super().__init__()
-        self.physics = physics
-        self.prior = ComplexRED()
-        self.data_fidelity = deepinv.optim.data_fidelity.L2()
-        self.g_step = gStep_FP_RED()
-        self.f_step = fStep_FP_RED()
-        self.cur_params = {
-            "stepsize": 1.0,
-            "lambda": lambda_,
-            "g_param": None,
+        denoiser = dwunet
+        data_fidelity = L2()
+        # data_fidelity.d = WeightedL2Distance()
+        # Unrolled optimization algorithm parameters
+        _params_algo = {k: [v] * max_iter for k, v in params_algo.items()}
+        prior = RED(denoiser)
+        # prior = None
+        iterator = create_iterator(
+            GDIteration(line_search=False),
+            prior=prior,
+        )
+        super().__init__(
+            iterator,
+            max_iter=max_iter,
+            trainable_params=trainable_params,
+            has_cost=iterator.has_cost,
+            data_fidelity=data_fidelity,
+            prior=prior,
+            params_algo=_params_algo,
+            custom_init=custom_init,
+            verbose=True,
+        )
+
+    def forward(self, y, physics, x_gt=None, compute_metrics=False, **kwargs):
+        return super().forward(y, physics, x_gt, compute_metrics, **kwargs)
+
+
+class ADMM(BaseUnfold):
+    def __init__(self, max_iter, params_algo, pretrained_params_algo=False):
+        denoiser = dwunet
+        data_fidelity = L2()
+        data_fidelity.d = WeightedL2Distance()
+        # Unrolled optimization algorithm parameters
+        lamb = params_algo["lambda"] * max_iter  # regularization parameter
+        stepsize = params_algo["stepsize"] * max_iter  # step sizes.
+        sigma_denoiser = params_algo["g_param"] * max_iter  # denoiser parameters
+        params_algo = {  # wrap all the restoration parameters in a 'params_algo' dictionary
+            "stepsize": stepsize,
+            "g_param": sigma_denoiser,
+            "lambda": lamb,
         }
-        self.iterations = iterations
-
-    def forward(
-        self,
-        kspace_data,
-        kspace_traj,
-        kspace_mask,
-        mvf,
-        csm,
-        image_init=None,
-        iterations=None,
-        stepsize=None,
-        lambda_=None,
-    ):
-        self.cur_params["stepsize"] = (
-            stepsize if stepsize is not None else self.cur_params["stepsize"]
+        trainable_params = ["stepsize", "g_param", "lambda"]
+        prior = PnP(denoiser)
+        iterator = create_iterator(
+            "ADMM",
+            prior=prior,
         )
-        self.cur_params["lambda"] = (
-            lambda_ if lambda_ is not None else self.cur_params["lambda"]
+        super().__init__(
+            iterator,
+            max_iter=max_iter,
+            trainable_params=trainable_params,
+            has_cost=iterator.has_cost,
+            data_fidelity=data_fidelity,
+            prior=prior,
+            params_algo=params_algo,
+            custom_init=custom_init,
+            verbose=True,
         )
-        t = iterations if iterations is not None else self.iterations
 
-        self.physics.update_parameters(
-            mvf_kernels=mvf,
-            csm_kernels=csm,
-            kspace_traj=kspace_traj,
-            kspace_mask=kspace_mask,
+
+def create_unfold_model(
+    iteration,
+    max_iter,
+    data_fidelity,
+    params_algo,
+    pretrained_params_algo=False,
+    physics_device=torch.device("cuda:0"),
+    denoiser_device=torch.device("cuda:1"),
+):
+    def custom_init(y, physics):
+        w = (
+            1
+            / 4
+            * area_based_radial_density_compensation(physics.N.kspace_spoke_traj[0, 0])
+        ).to(y.device)
+        x_init = physics.A_adjoint(y * w)
+        return {"est": (x_init, torch.zeros_like(x_init))}
+        # return {"est": (torch.zeros_like(x_init), torch.zeros_like(x_init))}
+
+    if iteration == "ADMM":
+        return dinv.unfolded.unfolded_builder(
+            iteration="ADMM",
+            prior=PnP(denoiser=denoiser),
+            max_iter=max_iter,
+            trainable_params=params_algo if pretrained_params_algo else [],
+            device=denoiser_device,
+            data_fidelity=data_fidelity,
+            params_algo=params_algo,
+            custom_init=custom_init,
+            verbose=True,
         )
-        y = kspace_data
-        x = self.physics.A_dagger(y, rtol=1e-2) if image_init is None else image_init
-        x_list = [x.detach().clone()]
-        for _ in range(t):
-            x = self.g_step(x, self.prior, self.cur_params)
-            x = self.f_step(x, self.data_fidelity, self.cur_params, y, self.physics)
-            x_list.append(x.detach().clone())
+    elif iteration == "RED":
+        return dinv.unfolded.unfolded_builder(
+            iteration=GDIteration,
+            prior=RED(denoiser=denoiser),
+            max_iter=max_iter,
+            trainable_params=params_algo if pretrained_params_algo else [],
+            device=denoiser_device,
+            data_fidelity=data_fidelity,
+            params_algo=params_algo,
+            custom_init=custom_init,
+            verbose=True,
+        )
 
-        return x, x_list
+
+def create_reconstructor(
+    denoiser_device=torch.device("cuda:1"),
+):
+    denoiser = ComplexUnet(
+        1,
+        1,
+        spatial_dims=3,
+        # conv_net=DWUNet(
+        conv_net=DWUNetSmall(
+            in_channels=2,
+            out_channels=2,
+            features=(16, 32, 64, 128, 256),
+            # features=(32, 64, 128, 256, 512),
+            strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)),
+            kernel_sizes=(
+                (3, 3, 3),
+                (3, 3, 3),
+                (3, 3, 3),
+                (3, 3, 3),
+                (3, 3, 3),
+            ),
+        ),
+        input_append_channel=None,
+        norm_with_given_std=True,
+    ).to(denoiser_device)
+
+    reconstructor = dinv.models.ArtifactRemoval(denoiser, mode="adjoint")
+
+    def backbone_inference(self, tensor_in, physics, y):
+        return self.backbone_net(tensor_in.unsqueeze(1), 1).squeeze(1)
+
+    reconstructor.backbone_inference = MethodType(backbone_inference, reconstructor)
+    return reconstructor

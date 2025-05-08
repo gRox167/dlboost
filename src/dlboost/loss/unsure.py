@@ -1,9 +1,10 @@
 import deepinv as dinv
 import torch
+from deepinv.loss import Loss
 from icecream import ic
 
 
-class UNSURE(dinv.loss.Loss):
+class UNSURE(Loss):
     def __init__(
         self,
         mode="gaussian",
@@ -141,7 +142,7 @@ class UNSURE(dinv.loss.Loss):
         self.gain, self.grad_gain = self.gradient_step(loss, self.gain, self.grad_gain)
 
 
-class ScoreLoss(dinv.loss.Loss):
+class ScoreLoss(Loss):
     r"""
     Learns score of noise distribution.
 
@@ -306,3 +307,4 @@ class ScoreModel(torch.nn.Module):
 
     def get_error(self):
         return self.error
+
