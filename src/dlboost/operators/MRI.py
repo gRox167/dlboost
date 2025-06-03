@@ -285,14 +285,14 @@ class KspaceMask_kz(LinearPhysics):
     def update_parameters(self, kspace_mask):
         self.kspace_mask = kspace_mask
 
-    def A(self, kspace_data: Shaped[KspaceSpokesData, "b ph ch kz"]):
+    def A(self, kspace_data: Shaped[KspaceSpokesData, "... kz"]):
         return einx.dot(
-            "b ph ch kz ..., kz -> b ph ch kz ...", kspace_data, self.kspace_mask
+            "... kz sp len, kz -> ... kz sp len", kspace_data, self.kspace_mask
         )
 
-    def A_adjoint(self, kspace_data: Shaped[KspaceSpokesData, "b ph ch kz"]):
+    def A_adjoint(self, kspace_data: Shaped[KspaceSpokesData, "... kz"]):
         return einx.dot(
-            "b ph ch kz ..., kz -> b ph ch kz ...", kspace_data, self.kspace_mask
+            "... kz sp len, kz -> ... kz sp len", kspace_data, self.kspace_mask
         )
 
 

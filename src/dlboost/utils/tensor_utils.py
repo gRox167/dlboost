@@ -27,7 +27,9 @@ def complex_as_real_2ch(x):
 
 def real_2ch_as_complex(x, ch=1):
     return torch.view_as_complex(
-        einx.rearrange("b (ch cmplx) ... -> b ch ... cmplx", x, ch=ch, cmplx=2).contiguous()
+        einx.rearrange(
+            "b (ch cmplx) ... -> b ch ... cmplx", x, ch=ch, cmplx=2
+        ).contiguous()
     )
 
 
@@ -388,7 +390,9 @@ def hybrid_kfold_split(
 def collate_fn(batch):
     # transpose dict structure out of list
     batch_transposed = tree_transpose(
-        tree_structure([0 for _ in batch]), tree_structure(batch[0]), batch
+        tree_structure([0 for _ in batch], none_is_leaf=True),
+        tree_structure(batch[0], none_is_leaf=True),
+        batch,
     )
     return {
         k: torch.stack(v) if torch.is_tensor(v[0]) else v

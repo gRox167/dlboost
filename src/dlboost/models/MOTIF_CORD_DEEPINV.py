@@ -180,7 +180,7 @@ class RARE_Phase2Phase_RED(BaseUnfold):
         # data_fidelity.d = WeightedL2Distance()
         # Unrolled optimization algorithm parameters
         _params_algo = {k: [v] * max_iter for k, v in params_algo.items()}
-        prior = RED(denoiser)
+        prior = RED(denoiser, unsqueeze_channel_dim=False)
         # prior = None
         iterator = create_iterator(
             GDIteration(line_search=False),
@@ -208,8 +208,33 @@ class SD_RED(BaseUnfold):
         max_iter,
         params_algo,
         trainable_params=["stepsize", "lambda"],
+        denoiser=ComplexUnet(
+            1,
+            1,
+            spatial_dims=3,
+            conv_net=DWUNetSmall(
+                in_channels=2,
+                out_channels=2,
+                features=(
+                    16,
+                    32,
+                    64,
+                    128,
+                    256,
+                ),
+                strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)),
+                kernel_sizes=(
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                    (3, 3, 3),
+                ),
+            ),
+            input_append_channel=None,
+            norm_with_given_std=True,
+        ),
     ):
-        denoiser = dwunet
         data_fidelity = L2()
         # data_fidelity.d = WeightedL2Distance()
         # Unrolled optimization algorithm parameters
@@ -315,31 +340,9 @@ def create_unfold_model(
 
 
 def create_reconstructor(
+    denoiser,
     denoiser_device=torch.device("cuda:1"),
 ):
-    denoiser = ComplexUnet(
-        1,
-        1,
-        spatial_dims=3,
-        # conv_net=DWUNet(
-        conv_net=DWUNetSmall(
-            in_channels=2,
-            out_channels=2,
-            features=(16, 32, 64, 128, 256),
-            # features=(32, 64, 128, 256, 512),
-            strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)),
-            kernel_sizes=(
-                (3, 3, 3),
-                (3, 3, 3),
-                (3, 3, 3),
-                (3, 3, 3),
-                (3, 3, 3),
-            ),
-        ),
-        input_append_channel=None,
-        norm_with_given_std=True,
-    ).to(denoiser_device)
-
     reconstructor = dinv.models.ArtifactRemoval(denoiser, mode="adjoint")
 
     def backbone_inference(self, tensor_in, physics, y):

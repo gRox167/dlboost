@@ -72,7 +72,10 @@ def mc_div(y1, y, f, physics, tau, precond=lambda x: x, rng: torch.Generator = N
     """
     b = torch.empty_like(y).normal_(generator=rng)
     y2 = physics.A(f(y + b * tau, physics))
-    return (precond(b) * precond(y2 - y1) / tau).reshape(y.size(0), -1).mean(1)
+    diff = precond(b) * precond(y2 - y1) / tau
+    if torch.is_complex(diff):
+        diff = torch.view_as_real(diff)
+    return diff.reshape(y.size(0), -1).mean(1)
 
 
 def unsure_gradient_step(loss, param, saved_grad, init_flag, step_size, momentum):
@@ -172,6 +175,7 @@ class SureGaussianLoss(Loss):
         self.grad_sigma = 0.0
         self.rng = rng
         if unsure:
+            # self.sigma2 = torch.nn.Parameter(torch.tensor(self.sigma2))
             self.sigma2 = torch.tensor(self.sigma2, requires_grad=True)
 
     def forward(
@@ -196,8 +200,12 @@ class SureGaussianLoss(Loss):
         div = (
             2 * self.sigma2 * mc_div(y1, y, model, physics, self.tau, metric, self.rng)
         )
-        mse = metric(y1 - y).pow(2).reshape(y.size(0), -1).mean(1)
-        loss_sure = mse + div - self.sigma2
+        diff = metric(y1 - y)
+        if torch.is_complex(diff):
+            diff = torch.view_as_real(diff)
+
+        mse = diff.pow(2).reshape(y.size(0), -1).mean(1)
+        loss_sure = mse + div  # - self.sigma2
 
         if self.unsure:  # update the estimate of the noise level
             self.sigma2, self.grad_sigma, self.init_flag = unsure_gradient_step(

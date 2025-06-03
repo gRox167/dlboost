@@ -89,7 +89,7 @@ class ComplexUnet(nn.Module):
 
         # Normalize input
         if not self.norm_with_given_std:
-            _, std = complex_normalize_abs_95_v(x)
+            _, std = complex_normalize_abs_95(x)
         x = x / std
 
         # Convert to real representation and prepare for UNet
