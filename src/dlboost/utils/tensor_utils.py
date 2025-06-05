@@ -17,8 +17,76 @@ from optree import tree_map, tree_structure, tree_transpose
 from plum import dispatch, overload
 from sklearn.model_selection import KFold
 from torch import Tensor
-from torch.nn import functional as f
+from torch.nn import functional as F
 from xarray import DataArray
+
+
+class GridSample3dForward(torch.autograd.Function):
+    @staticmethod
+    def forward(input, grid, align_corners):
+        assert input.ndim == 5 and grid.ndim == 5
+        output = F.grid_sample(
+            input=input,
+            grid=grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=align_corners,
+        )
+        return output
+
+    # NEW: only runs when higher-order AD needs the saved tensors
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        input, grid, align_corners = inputs  # tuple unpack
+        ctx.save_for_backward(input, grid)  # what backward() needs
+        ctx.align_corners = align_corners
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, grid = ctx.saved_tensors
+        align_corners = ctx.align_corners
+        grad_input, grad_grid = GridSample3dBackward.apply(
+            grad_output, input, grid, align_corners
+        )
+        return grad_input, grad_grid, None
+
+
+class GridSample3dBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(grad_output, input, grid, align_corners):
+        op = torch.ops.aten.grid_sampler_3d_backward  # raw ATen kernel
+        grad_input, grad_grid = op(
+            grad_output,
+            input,
+            grid,
+            0,  # mode  (0 = bilinear/trilinear)
+            0,  # padding_mode (0 = zeros)
+            align_corners,  # align_corners (False in forward)
+            (True, True),  # output_mask      (return both grads)
+        )
+        return grad_input, grad_grid
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        _, _, grid, align_corners = inputs  # we only need 'grid' later
+        ctx.save_for_backward(grid)
+        ctx.align_corners = align_corners
+
+    @staticmethod
+    def backward(ctx, grad2_grad_input, grad2_grad_grid):
+        _ = grad2_grad_grid  # unused
+        (grid,) = ctx.saved_tensors
+        align_corners = ctx.align_corners
+
+        # 2nd-order gradient w.r.t. grad_output
+        grad2_grad_output = (
+            GridSample3dForward.apply(grad2_grad_input, grid, align_corners)
+            if ctx.needs_input_grad[0]
+            else None
+        )
+
+        # we stop gradients here for 'input' and 'grid'
+        return grad2_grad_output, None, None, None
 
 
 def complex_as_real_2ch(x):
@@ -229,22 +297,22 @@ def for_vmap(func, in_dims=0, out_dims=0, batch_size: Union[int, None] = None):
 #         return _out if len(_out) > 1 else _out[0]
 
 
-def interpolate(img, scale_factor, mode, align_corners=True):
+def interpolate(img, scale_factor, mode, align_corners=False):
     if not torch.is_complex(img):
-        return f.interpolate(
+        return F.interpolate(
             img,
             scale_factor=scale_factor,
             mode=mode,
             align_corners=align_corners,
         )
     else:
-        r = f.interpolate(
+        r = F.interpolate(
             img.real,
             scale_factor=scale_factor,
             mode=mode,
             align_corners=align_corners,
         )
-        i = f.interpolate(
+        i = F.interpolate(
             img.imag,
             scale_factor=scale_factor,
             mode=mode,
@@ -275,7 +343,7 @@ def pad(data: Tensor, dims, pad_sizes, mode="constant", value=0):
 
     # Convert the list to a tuple and apply padding
     pad_config = tuple(pad_config)
-    return f.pad(data, pad_config, mode=mode, value=value)
+    return F.pad(data, pad_config, mode=mode, value=value)
 
 
 def pad(data: DataArray, pad_sizes, mode="constant", value=0):
@@ -398,3 +466,48 @@ def collate_fn(batch):
         k: torch.stack(v) if torch.is_tensor(v[0]) else v
         for k, v in batch_transposed.items()
     }
+
+
+# class GridSample2dForward(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, input, grid):
+#         assert input.ndim == 4
+#         assert grid.ndim == 4
+#         output = torch.nn.functional.grid_sample(
+#             input=input,
+#             grid=grid,
+#             mode="bilinear",
+#             padding_mode="zeros",
+#             align_corners=False,
+#         )
+#         ctx.save_for_backward(input, grid)
+#         return output
+
+#     @staticmethod
+#     def backward(ctx, grad_output):
+#         input, grid = ctx.saved_tensors
+#         grad_input, grad_grid = GridSample2dBackward.apply(grad_output, input, grid)
+#         return grad_input, grad_grid
+
+
+# class GridSample2dBackward(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, grad_output, input, grid):
+#         op = torch._C._jit_get_operation("aten::grid_sampler_2d_backward")
+#         grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
+#         ctx.save_for_backward(grid)
+#         return grad_input, grad_grid
+
+#     @staticmethod
+#     def backward(ctx, grad2_grad_input, grad2_grad_grid):
+#         _ = grad2_grad_grid  # unused
+#         (grid,) = ctx.saved_tensors
+#         grad2_grad_output = None
+#         grad2_input = None
+#         grad2_grid = None
+
+#         if ctx.needs_input_grad[0]:
+#             grad2_grad_output = GridSample2dForward.apply(grad2_grad_input, grid)
+
+#         assert not ctx.needs_input_grad[2]
+#         return grad2_grad_output, grad2_input, grad2_grid

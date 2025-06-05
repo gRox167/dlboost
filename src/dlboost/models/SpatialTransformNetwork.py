@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from dlboost.utils.tensor_utils import (
+    GridSample3dBackward,
+    GridSample3dForward,
+)
+
 
 class SpatialTransformNetwork(nn.Module):
     def __init__(self, size, mode="bilinear", dims=3):
@@ -21,6 +26,8 @@ class SpatialTransformNetwork(nn.Module):
         # than they need to be. so far, there does not appear to be an elegant solution.
         # see: https://discuss.pytorch.org/t/how-to-register-buffer-without-polluting-state-dict
         self.register_buffer("grid", grid)
+        self.grid_sampling = GridSample3dForward if dims == 3 else None
+        self.grid_sampling_backward = GridSample3dBackward if dims == 3 else None
 
     def forward(self, src, flow, return_phi=False):
         # new locations
@@ -43,11 +50,9 @@ class SpatialTransformNetwork(nn.Module):
             new_locs = new_locs.float()
             src = src.float()
             if return_phi:
-                return F.grid_sample(
-                    src, new_locs, align_corners=True, mode=self.mode
-                ), new_locs
+                return self.grid_sampling.apply(src, new_locs, False), new_locs
             else:
-                return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
+                return self.grid_sampling.apply(src, new_locs, False)
 
 
 class VecInt(nn.Module):
@@ -104,6 +109,6 @@ class CompositionTransform(nn.Module):
             * 2
         )
         compos_flow = (
-            F.grid_sample(flow_1, grid, mode="bilinear", align_corners=True) + flow_2
+            F.grid_sample(flow_1, grid, mode="bilinear", align_corners=False) + flow_2
         )
         return compos_flow

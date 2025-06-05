@@ -55,10 +55,10 @@ class SpatialTransformer(nn.Module):
 
         if return_phi:
             return F.grid_sample(
-                src, new_locs, align_corners=True, mode=self.mode
+                src, new_locs, align_corners=False, mode=self.mode
             ), new_locs
         else:
-            return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
+            return F.grid_sample(src, new_locs, align_corners=False, mode=self.mode)
 
 
 def resize_deformation_field(field, factor, ndims=3):
@@ -71,7 +71,7 @@ def resize_deformation_field(field, factor, ndims=3):
         mode = "trilinear"
     else:
         raise ValueError("Only 2D and 3D supported")
-    _field = F.interpolate(field, scale_factor=factor, mode=mode, align_corners=True)
+    _field = F.interpolate(field, scale_factor=factor, mode=mode, align_corners=False)
     return einx.multiply(
         "b [c] ...", _field, torch.tensor(factor, device=_field.device)
     )

@@ -159,11 +159,11 @@ class DWInvertedUpStage(nn.Module):
         self.checkpointing = checkpointing
         if spatial_dims == 2:
             self.upsample = nn.Upsample(
-                scale_factor=upsample_factors, mode="bilinear", align_corners=True
+                scale_factor=upsample_factors, mode="bilinear", align_corners=False
             )
         elif spatial_dims == 3:
             self.upsample = nn.Upsample(
-                scale_factor=upsample_factors, mode="trilinear", align_corners=True
+                scale_factor=upsample_factors, mode="trilinear", align_corners=False
             )
         else:
             raise NotImplementedError("Only 2D and 3D are supported.")
@@ -610,40 +610,4 @@ class DWUNet(nn.Module):
 
         logits = self.final_conv(u1)
 
-        return logits
-
-
-class DWUNet_Checkpointing(DWUNet):
-    def __init__(
-        self,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-
-    def forward(self, x: torch.Tensor):
-        """
-        Args:
-            x: input should have spatially N dimensions
-                ``(Batch, in_channels, dim_0[, dim_1, ..., dim_N-1])``, N is defined by `spatial_dims`.
-                It is recommended to have ``dim_n % 16 == 0`` to ensure all maxpooling inputs have
-                even edge lengths.
-
-        Returns:
-            A torch Tensor of "raw" predictions in shape
-            ``(Batch, out_channels, dim_0[, dim_1, ..., dim_N-1])``.
-        """
-        with torch.autograd.graph.save_on_cpu(pin_memory=True):
-            x0 = self.conv_0(x)
-            x1 = self.down_1(x0)
-            x2 = self.down_2(x1)
-            x3 = self.down_3(x2)
-            x4 = self.down_4(x3)
-
-            u4 = self.upcat_4(x4, x3)
-            u3 = self.upcat_3(u4, x2)
-            u2 = self.upcat_2(u3, x1)
-            u1 = self.upcat_1(u2, x0)
-
-            logits = self.final_conv(u1)
         return logits

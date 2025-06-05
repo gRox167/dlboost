@@ -137,22 +137,6 @@ class MVF_Dyn(LinearPhysics):
     def A_adjoint(self, y, **kwargs):
         """Calculate adjoint operator using autograd"""
         return self.A_adjoint_func(y, **kwargs)
-        # Create a dummy input with requires_grad=True
-        # batch_size = y.shape[0]
-        # d, h, w = y.shape[2], y.shape[3], y.shape[4]
-        # x = torch.zeros(
-        #     batch_size, d, h, w, dtype=y.dtype, device=y.device, requires_grad=True
-        # )
-
-        # # Apply the forward operator
-        # Ax = self.A(x)
-
-        # # Compute gradient of inner product with respect to x
-        # grad = torch.autograd.grad(
-        #     Ax, x, create_graph=kwargs.get("create_graph", True)
-        # )[0]
-
-        # return grad
 
 
 class Repeat(LinearPhysics):
@@ -280,10 +264,10 @@ class NUFFT_2D_FFT_1D(LinearPhysics):
 class KspaceMask_kz(LinearPhysics):
     def __init__(self):
         super().__init__()
-        self.kspace_mask = None
 
     def update_parameters(self, kspace_mask):
-        self.kspace_mask = kspace_mask
+        if kspace_mask is not None:
+            self.kspace_mask = kspace_mask
 
     def A(self, kspace_data: Shaped[KspaceSpokesData, "... kz"]):
         return einx.dot(
