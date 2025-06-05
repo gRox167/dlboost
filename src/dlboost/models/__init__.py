@@ -1,6 +1,6 @@
 from .ComplexUnet import ComplexUnet, ComplexUnetDenoiser
 from .DenoiseUNet import AnisotropicUNet  # noqa: F401
-from .DWUNet import DWUNet, DWUNetSmall
+from .DWUNet import DWUNet, DWUNet_Reg, DWUNetSmall
 from .EDSR import EDSR, ShuffleEDSR
 from .KSpaceTransformer import KSpaceTransformer
 from .MedNeXt import MedNeXt

@@ -7,6 +7,7 @@ import torch
 # from monai.utils import ensure_tuple_rep
 from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from torch import nn
+from torch.distributions.normal import Normal
 
 # from dlboost.models.BasicUNet import Down
 
@@ -611,3 +612,45 @@ class DWUNet(nn.Module):
         logits = self.final_conv(u1)
 
         return logits
+
+
+class DWUNet_Reg(nn.Module):
+    def __init__(
+        self,
+        spatial_dims: int = 3,
+        in_channels: int = 2,
+        out_channels: int = 3,
+        strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
+        kernel_sizes=((3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3)),
+        features: Sequence[int] = (32, 64, 128, 256, 512),
+        # stages = (2,2,2,2),
+        act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        norm: str | tuple = ("instance", {"affine": True}),
+        dropout: float | tuple = 0.0,
+        checkpointing: bool = False,
+    ):
+        super().__init__()
+        self.net = DWUNet(
+            spatial_dims,
+            in_channels,
+            features[0],
+            strides,
+            kernel_sizes,
+            features,
+            act,
+            norm,
+            dropout,
+            checkpointing,
+        )
+        if spatial_dims == 2:
+            conv = nn.Conv2d
+        elif spatial_dims == 3:
+            conv = nn.Conv3d
+        self.flow = conv(features[0], out_channels, kernel_size=3, padding=1)
+        self.flow.weight = nn.Parameter(Normal(0, 1e-5).sample(self.flow.weight.shape))
+        self.flow.bias = nn.Parameter(torch.zeros(self.flow.bias.shape))
+
+    @torch.compile()
+    def forward(self, x: torch.Tensor):
+        x = self.net(x)
+        return self.flow(x)
