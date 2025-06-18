@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fireants.utils.imageutils import jacobian
 
 from dlboost.utils.tensor_utils import (
     GridSample3dBackward,
@@ -16,7 +17,7 @@ class SpatialTransformNetwork(nn.Module):
 
         # create sampling grid
         vectors = [torch.arange(0, s) for s in size]
-        grids = torch.meshgrid(vectors)
+        grids = torch.meshgrid(vectors, indexing="ij")
         grid = torch.stack(grids)
         grid = torch.unsqueeze(grid, 0)
         grid = grid.type(torch.FloatTensor)
@@ -50,9 +51,9 @@ class SpatialTransformNetwork(nn.Module):
             new_locs = new_locs.float()
             src = src.float()
             if return_phi:
-                return self.grid_sampling.apply(src, new_locs, False), new_locs
+                return self.grid_sampling.apply(src, new_locs, True), new_locs
             else:
-                return self.grid_sampling.apply(src, new_locs, False)
+                return self.grid_sampling.apply(src, new_locs, True)
 
 
 class VecInt(nn.Module):
@@ -109,6 +110,76 @@ class CompositionTransform(nn.Module):
             * 2
         )
         compos_flow = (
-            F.grid_sample(flow_1, grid, mode="bilinear", align_corners=False) + flow_2
+            F.grid_sample(flow_1, grid, mode="bilinear", align_corners=True) + flow_2
         )
         return compos_flow
+
+
+def warp(
+    moving_image, displacement_field, mass_preserving=False, oversample_ratio=(2, 2, 2)
+):
+    """
+    Warps a 3D image using a displacement field.
+    Args:
+        moving_image (torch.Tensor): The image to be warped, shape (B, C, D, H, W).
+        displacement_field (torch.Tensor): The displacement field, shape (B, D, H, W, 3). Last dimension contains the displacement in x, y, z order. Range should be [-1, 1] for each dimension.
+    Returns:
+        torch.Tensor: The warped image, shape (B, C, D, H, W).
+    """
+    if oversample_ratio is not None:
+        moving_image_os = F.interpolate(
+            moving_image,
+            scale_factor=oversample_ratio,
+            mode="trilinear",
+            align_corners=True,
+        )
+        displacement_field_os = F.interpolate(
+            displacement_field.permute(
+                0, 4, 1, 2, 3
+            ),  # move last dim to second position
+            scale_factor=oversample_ratio,
+            mode="trilinear",
+            align_corners=True,
+        ).permute(0, 2, 3, 4, 1)  # move back to original order
+    else:
+        moving_image_os = moving_image
+        displacement_field_os = displacement_field
+    # new locations
+    grid = F.affine_grid(
+        torch.eye(3, 4, device=moving_image_os.device)[None],
+        (1, 1) + moving_image_os.shape[2:],
+        align_corners=True,
+    )
+    warped_coordinates = grid + displacement_field_os
+    moved_image_os = F.grid_sample(
+        moving_image_os, warped_coordinates, "bilinear", align_corners=True
+    )
+    if mass_preserving:
+        J = J = jacobian(warped_coordinates, normalize=True).permute(0, 2, 3, 4, 1, 5)[
+            :, 1:-1, 1:-1, 1:-1, :
+        ]
+        Jdet = torch.linalg.det(J)
+        # if mass preserving, we need to scale the image by the inverse of determinant of the Jacobian
+        moved_image_os[:, :, 1:-1, 1:-1, 1:-1] /= Jdet.unsqueeze(1) + 1e-6
+    if oversample_ratio is not None:
+        # interpolate back to original resolution
+        moved_image = F.interpolate(
+            moved_image_os,
+            scale_factor=tuple(1 / s for s in oversample_ratio),
+            mode="trilinear",
+            align_corners=True,
+        )
+    else:
+        moved_image = moved_image_os
+    return moved_image
+    # return GridSample3dForward.apply(moving_image, warped_coordinates, True)
+
+    # warped_coordinates = einx.rearrange(
+    #     "b v ... -> b ... v", grid + displacement_field
+    # ).flip(-1)  # rearrange to match grid_sample input
+    # flip last dimention from zyx to xyz order
+    # if return_warped_coordinates:
+    #     return GridSample3dForward.apply(
+    #         moving_image, warped_coordinates, True
+    #     ), warped_coordinates
+    # else:

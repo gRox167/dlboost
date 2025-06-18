@@ -55,10 +55,15 @@ class SpatialTransformer(nn.Module):
 
         if return_phi:
             return F.grid_sample(
-                src, new_locs, align_corners=False, mode=self.mode
+                src,
+                new_locs,
+                align_corners=True,
+                mode=self.mode,
+                # src, new_locs, align_corners=False, mode=self.mode
             ), new_locs
         else:
-            return F.grid_sample(src, new_locs, align_corners=False, mode=self.mode)
+            return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
+            # return F.grid_sample(src, new_locs, align_corners=False, mode=self.mode)
 
 
 def resize_deformation_field(field, factor, ndims=3):

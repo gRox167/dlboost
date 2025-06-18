@@ -384,7 +384,6 @@ class DWUNet(nn.Module):
         strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
         kernel_sizes=((3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3)),
         features: Sequence[int] = (32, 64, 128, 256, 512),
-        # stages = (2,2,2,2),
         act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
         norm: str | tuple = ("instance", {"affine": True}),
         dropout: float | tuple = 0.0,

@@ -11,11 +11,19 @@ from mrboost.density_compensation.area_based_radial import (
 )
 
 from dlboost.iterators.gradient_descent import GDIteration
+
+# from dlboost.loss.data_fidelity import L2
 from dlboost.loss.weightedL2 import WeightedL2Distance
 from dlboost.models import ComplexUnet, DWUNetSmall
 from dlboost.operators.MRI import (
+    CSM,
     NUFFT,
+    NUFFT_2D_FFT_1D,
+    NUFFT_3D,
     CSM_FixPh,
+    CSM_NUFFT_Combined,
+    KspaceMask,
+    KspaceMask_kz,
     MVF_Dyn,
     Repeat,
 )
@@ -29,7 +37,8 @@ class MR_Forward_Model(LinearPhysics):
         MVF_physics: MVF_Dyn | Repeat = MVF_Dyn((80, 320, 320)),
         CSM_physics=CSM_FixPh((1, 8, 8)),
         NUFFT_physics=NUFFT((320, 320)),
-        KspaceMask_physics=None,
+        CSM_NUFFT_combined_physics=CSM_NUFFT_Combined(),
+        KspaceMask_physics=LinearPhysics(),
         max_iter=100,
         tol=1e-2,
         device=torch.device("cuda:0"),
@@ -39,11 +48,8 @@ class MR_Forward_Model(LinearPhysics):
         self.M = MVF_physics
         self.S = CSM_physics
         self.N = NUFFT_physics
-        if KspaceMask_physics is None:
-            self.forward_model = self.N * self.S * self.M
-        else:
-            self.MASK = KspaceMask_physics
-            self.forward_model = self.MASK * self.N * self.S * self.M
+        self.MASK = KspaceMask_physics
+        self.forward_model = self.MASK * self.N * self.S * self.M
 
         self.max_iter = max_iter
         self.tol = tol
@@ -58,16 +64,30 @@ class MR_Forward_Model(LinearPhysics):
         kspace_mask=None,
         nufft_im_size=None,
     ):
-        if hasattr(self.M, "update_parameters") and mvf_kernels is not None:
-            self.M.update_parameters(mvf_kernels.to(self.device))
-        if hasattr(self.S, "update_parameters") and csm_kernels is not None:
-            self.S.update_parameters(csm_kernels.to(self.device))
+        if hasattr(self, "M") and mvf_kernels is not None:
+            if isinstance(self.M, Repeat):
+                self.M.update_parameters(mvf_kernels.to(self.device))
+        if hasattr(self, "S") and csm_kernels is not None:
+            if isinstance(self.S, (CSM_FixPh, CSM)):
+                self.S.update_parameters(csm_kernels.to(self.device))
+        if hasattr(self, "N") and kspace_traj is not None:
+            if isinstance(self.N, (NUFFT, NUFFT_2D_FFT_1D, NUFFT_3D)):
+                self.N.update_parameters(
+                    kspace_traj=kspace_traj.to(self.device),
+                    nufft_im_size=nufft_im_size,
+                )
+            elif isinstance(self.N, CSM_NUFFT_Combined):
+                # CSM_NUFFT_Combined requires both kspace_traj and csm_kernels
+                self.N.update_parameters(
+                    kspace_traj=kspace_traj.to(self.device),
+                    nufft_im_size=nufft_im_size,
+                    csm=csm_kernels.to(self.device),
+                )
         if hasattr(self, "MASK") and kspace_mask is not None:
-            self.MASK.update_parameters(kspace_mask.to(self.device))
-        if hasattr(self.N, "update_parameters") and (
-            nufft_im_size is not None or kspace_traj is not None
-        ):
-            self.N.update_parameters(kspace_traj.to(self.device), nufft_im_size)
+            if isinstance(self.MASK, (KspaceMask_kz, KspaceMask)):
+                # Update the mask parameters if it is a LinearPhysics object
+                # This is useful for dynamic masks or other mask types
+                self.MASK.update_parameters(kspace_mask.to(self.device))
 
     def A(self, image):
         input_device = image.device
@@ -94,11 +114,13 @@ class MR_Forward_Model(LinearPhysics):
     ):
         input_device = y.device
         y = y.to(self.device)
-        return (
-            super()
-            .A_dagger(y, solver, max_iter, tol, verbose, **kwargs)
-            .to(input_device)
-        )
+        with torch.no_grad():
+            results = (
+                super()
+                .A_dagger(y, solver, max_iter, tol, verbose, **kwargs)
+                .to(input_device)
+            )
+        return results
 
     def prox_l2(
         self, z, y, gamma, solver="CG", max_iter=None, tol=None, verbose=False, **kwargs
@@ -110,6 +132,40 @@ class MR_Forward_Model(LinearPhysics):
             super()
             .prox_l2(z, y, gamma, solver, max_iter, tol, verbose, **kwargs)
             .to(input_device)
+        )
+
+    def sequential_A(self, image):
+        input_device = image.device
+        image = image.to(self.device)
+        image_multi_phase = self.M.A(image)
+        image_csm = self.S.A(image_multi_phase)
+        y_unmasked = self.N.A(image_csm)
+        if hasattr(self, "MASK"):
+            y_masked = self.MASK.A(y)
+        else:
+            y_masked = y_unmasked
+        return (
+            image_multi_phase.to(input_device),
+            image_csm.to(input_device),
+            y_unmasked.to(input_device),
+            y_masked.to(input_device),
+        )
+
+    def sequential_A_adjoint(self, y):
+        input_device = y.device
+        y = y.to(self.device)
+        if hasattr(self, "MASK"):
+            y_unmasked = self.MASK.A_adjoint(y)
+        else:
+            y_unmasked = y
+        image_multi_ch = self.N.A_adjoint(y_unmasked)
+        image_multi_phase = self.S.A_adjoint(image_multi_ch)
+        image = self.M.A_adjoint(image_multi_phase)
+        return (
+            image.to(input_device),
+            image_multi_phase.to(input_device),
+            image_multi_ch.to(input_device),
+            y_unmasked.to(input_device),
         )
 
 
@@ -138,8 +194,12 @@ dwunet = ComplexUnet(
 
 
 def custom_init(y, physics):
-    x_init = physics.A_adjoint(y * physics.weight)
-    return {"est": (x_init, torch.zeros_like(x_init))}
+    if hasattr(physics, "x_init") and physics.x_init is not None:
+        x_init = physics.x_init
+    else:
+        # If no initial condition is provided, use the adjoint of the forward model
+        x_init = physics.A_adjoint(y * physics.weight.to(y.device))
+    return {"est": (x_init, x_init.clone())}
     # return {"est": (torch.zeros_like(x_init), torch.zeros_like(x_init))}
 
 

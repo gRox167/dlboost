@@ -78,8 +78,10 @@ class GDIteration(OptimIterator):
                 print(f"stepsize: {stepsize}")
                 # save the stepsize for the next iteration
                 cur_params["stepsize"] = stepsize
-
-        grad = stepsize * (self.g_step(x_prev, cur_prior, cur_params) + f_grad)
+        if cur_params["lambda"] == 0:
+            grad = stepsize * f_grad
+        else:
+            grad = stepsize * (self.g_step(x_prev, cur_prior, cur_params) + f_grad)
         x = x_prev - grad
         F = (
             self.F_fn(x, cur_data_fidelity, cur_prior, cur_params, y, physics)

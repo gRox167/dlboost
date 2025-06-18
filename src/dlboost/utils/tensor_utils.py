@@ -297,7 +297,7 @@ def for_vmap(func, in_dims=0, out_dims=0, batch_size: Union[int, None] = None):
 #         return _out if len(_out) > 1 else _out[0]
 
 
-def interpolate(img, scale_factor, mode, align_corners=False):
+def interpolate(img, scale_factor, mode, align_corners=True):
     if not torch.is_complex(img):
         return F.interpolate(
             img,
