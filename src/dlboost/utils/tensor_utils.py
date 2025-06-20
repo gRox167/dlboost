@@ -12,7 +12,8 @@ from typing import (
 
 import einx
 import torch
-from jaxtyping import PyTree
+from jaxtyping import PyTree, Shaped
+from mrboost.type_utils import ComplexImage3D
 from optree import tree_map, tree_structure, tree_transpose
 from plum import dispatch, overload
 from sklearn.model_selection import KFold
@@ -297,7 +298,13 @@ def for_vmap(func, in_dims=0, out_dims=0, batch_size: Union[int, None] = None):
 #         return _out if len(_out) > 1 else _out[0]
 
 
-def interpolate(img, scale_factor, mode, align_corners=True):
+@overload
+def interpolate(
+    img: Shaped[ComplexImage3D, "b ch"],
+    scale_factor: Sequence = (1.0, 1.0, 1.0),
+    mode="trilinear",
+    align_corners=True,
+):
     if not torch.is_complex(img):
         return F.interpolate(
             img,
@@ -319,6 +326,68 @@ def interpolate(img, scale_factor, mode, align_corners=True):
             align_corners=align_corners,
         )
         return torch.complex(r, i)
+
+
+@overload
+def interpolate(
+    img: ComplexImage3D,
+    scale_factor: Sequence = (1.0, 1.0, 1.0),
+    mode="trilinear",
+    align_corners=True,
+):
+    return (
+        interpolate(
+            img.unsqueeze(0).unsqueeze(0),
+            scale_factor=scale_factor,
+            mode=mode,
+            align_corners=align_corners,
+        )
+        .squeeze(0)
+        .squeeze(0)
+    )
+
+
+@overload
+def interpolate(
+    img: Shaped[ComplexImage3D, "b"],
+    scale_factor: Sequence = (1.0, 1.0, 1.0),
+    mode="trilinear",
+    align_corners=True,
+):
+    return interpolate(
+        img.unsqueeze(1),
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners,
+    ).squeeze(1)
+
+
+@overload
+def interpolate(
+    img: Shaped[ComplexImage3D, "*b0 b1 b2 ch"],
+    scale_factor: Sequence = (1.0, 1.0, 1.0),
+    mode="trilinear",
+    align_corners=True,
+):
+    b, *ph, ch, d, h, w = img.shape
+    img = interpolate(
+        einx.rearrange("b ph... ch d h w -> (b ph...) ch d h w", img),
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners,
+    )
+    img = einx.rearrange("(b ph...) ch d h w -> b ph... ch d h w", img, ph=ph)
+    return img
+
+
+@dispatch
+def interpolate(
+    img,
+    scale_factor,
+    mode,
+    align_corners,
+):
+    pass
 
 
 def pad(data: Tensor, dims, pad_sizes, mode="constant", value=0):

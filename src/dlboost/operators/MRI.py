@@ -18,7 +18,12 @@ from mrboost.computation import (
     nufft_adj_3d,
     radial_spokes_to_kspace_point,
 )
-from mrboost.type_utils import ComplexImage3D, KspaceSpokesData, KspaceSpokesTraj
+from mrboost.type_utils import (
+    ComplexImage3D,
+    Image3D,
+    KspaceSpokesData,
+    KspaceSpokesTraj,
+)
 from torchopt.linear_solve import solve_cg
 
 
@@ -26,9 +31,17 @@ class CSM(LinearPhysics):
     def __init__(
         self,
         scale_factor: Tuple[int, int, int] | None = (1, 8, 8),
+        dot_descriptor: str = "b ... d h w, b ch d h w -> b ... ch d h w",
+        **kwargs,
     ):
         super().__init__()
         self.scale_factor = scale_factor
+        self.dot_descriptor = dot_descriptor
+        csm_str = dot_descriptor.split("->")[0].split(",")[1].strip()
+        x_str = dot_descriptor.split("->")[0].split(",")[0].strip()
+        y_str = dot_descriptor.split("->")[1].strip()
+        self.adjoint_dot_descriptor = f"{x_str}, {csm_str} -> {y_str}"
+        self.kwargs = kwargs
 
     def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "*b ch"]):
         """
@@ -37,12 +50,7 @@ class CSM(LinearPhysics):
             csm_kernels (Shaped[ComplexImage3D, "*b ch"]): Coil sensitivity maps. CSM need to have batch dimension the same as the image.
             we assume that the CSM are in the shape of (..., channels, depth, height, width).
         """
-        if self.scale_factor is not None:
-            self._csm = interpolate(
-                csm_kernels, scale_factor=self.scale_factor, mode="trilinear"
-            )
-        else:
-            self._csm = csm_kernels
+        self._csm = csm_kernels
 
     def A(
         self,
@@ -51,14 +59,21 @@ class CSM(LinearPhysics):
         **kwargs,
     ):
         if channel_index is not None:
-            # If a specific channel index is provided, select that channel
-            return einx.dot(
-                "b... d h w, b... ch d h w -> b... ch d h w",
-                x,
-                self._csm[..., channel_index : channel_index + 1, :, :, :],
-            )
+            _csm_ch = self._csm[..., channel_index : channel_index + 1, :, :, :]
         else:
-            return einx.dot("b... d h w, b... ch d h w -> b... ch d h w", x, self._csm)
+            _csm_ch = self._csm
+        if self.scale_factor is not None:
+            _csm_ch = interpolate(
+                _csm_ch,
+                scale_factor=self.scale_factor,
+                mode="trilinear",
+                align_corners=True,
+            )
+        return einx.dot(
+            self.dot_descriptor,
+            x,
+            _csm_ch,
+        )
 
     def A_adjoint(
         self,
@@ -67,10 +82,23 @@ class CSM(LinearPhysics):
         **kwargs,
     ):
         if channel_index is not None:
-            # If a specific channel index is provided, select that channel
-            return y.squeeze(-4) * self._csm[..., channel_index, :, :, :].conj()
+            _csm_ch = self._csm[..., channel_index : channel_index + 1, :, :, :]
         else:
-            return einx.sum("b... [ch] d h w", y * self._csm.conj())
+            _csm_ch = self._csm
+        if self.scale_factor is not None:
+            _csm_ch = interpolate(
+                _csm_ch,
+                scale_factor=self.scale_factor,
+                mode="trilinear",
+                align_corners=True,
+            )
+
+        return einx.dot(
+            self.adjoint_dot_descriptor,
+            y,
+            _csm_ch.conj(),
+            **self.kwargs,
+        )
 
 
 class CSM_FixPh(LinearPhysics):
@@ -112,16 +140,6 @@ class MVF_Dyn(LinearPhysics):
         # self.spatial_transform = SpatialTransformNetwork(size=size, mode="bilinear")
 
     def update_parameters(self, mvf_kernels: Shaped[torch.Tensor, "b ph d h w v"]):
-        # self.ph_to_move = mvf_kernels.shape[0]
-        # _mvf = einx.rearrange("ph v d h w -> ph v d h w", mvf_kernels)
-        # if self.scale_factor is not None:
-        #     b, ph, v, d, h, w = mvf_kernels.shape
-        #     mvf_kernels = einx.rearrange("b ph v d h w -> (b ph) v d h w", mvf_kernels)
-        #     mvf_kernels = resize_deformation_field(mvf_kernels, self.scale_factor)
-        #     self._mvf = einx.rearrange(
-        #         "(b ph) v d h w -> b ph v d h w", mvf_kernels, ph=ph
-        #     )
-        # else:
         with torch.amp.autocast("cuda", enabled=False):
             self._mvf = mvf_kernels
             # batches, self.ph_to_move, v, d, h, w = self._mvf.shape
@@ -141,10 +159,6 @@ class MVF_Dyn(LinearPhysics):
                 device=self._mvf.device,
                 dtype=torch.complex64,
             )
-        # if self.spatial_transform.grid.device != self._mvf.device:
-        #     self.spatial_transform.grid = self.spatial_transform.grid.to(
-        #         self._mvf.device
-        #     )
 
     def A(self, image: Shaped[ComplexImage3D, "b"]):
         with torch.amp.autocast("cuda", enabled=False):
@@ -326,124 +340,6 @@ class NUFFT_2D_FFT_1D(LinearPhysics):
         )
 
 
-class CSM_NUFFT_Combined(LinearPhysics):
-    def __init__(
-        self,
-        csm_operator=CSM_FixPh(),
-        nufft_operator=NUFFT_2D_FFT_1D(),
-        loop_over_coils=False,
-    ):
-        super().__init__()
-        self.C = csm_operator
-        self.N = nufft_operator
-        self.loop_over_coils = loop_over_coils
-
-    def update_parameters(self, kspace_traj, nufft_im_size=None, csm=None):
-        if nufft_im_size is not None or kspace_traj is not None:
-            self.N.update_parameters(kspace_traj, nufft_im_size)
-        if csm is not None:
-            self.C.update_parameters(csm)
-
-    def A(
-        self,
-        x: Shaped[ComplexImage3D, "*b"],
-    ) -> Shaped[KspaceSpokesData, "*b ch kz"]:
-        """
-        do it coil by coil
-        """
-        if self.loop_over_coils:
-            *b, d, h, w = x.shape
-            ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
-            sp, l = self.N.kspace_spoke_traj.shape[-2:]
-
-            y = torch.zeros(*b, ch, d, sp, l, dtype=x.dtype, device=x.device)
-            for ch_idx in range(ch):
-                # Apply coil sensitivity operator
-                image_single_coil = self.C.A(x, channel_index=ch_idx)
-                # Apply NUFFT and 1D FFT
-                y[..., ch_idx : ch_idx + 1, :, :, :] = self.N.A(image_single_coil)
-        else:
-            # Apply coil sensitivity operator
-            x_coils = self.C.A(x)
-            # Apply NUFFT and 1D FFT
-            y = self.N.A(x_coils)
-        return y
-
-    def A_adjoint(
-        self,
-        y: Shaped[KspaceSpokesData, "*b ch kz"],
-    ) -> Shaped[ComplexImage3D, "*b ch"]:
-        if self.loop_over_coils:
-            *b, ch, kz, sp, l = y.shape
-            h, w = self.N.nufft_im_size
-            # batch_size = prod(b)
-            x = torch.zeros(
-                *b,
-                kz,
-                h,
-                w,
-                dtype=y.dtype,
-                device=y.device,
-            )
-            for ch_idx in range(ch):
-                # Apply adjoint of kspace mask operator
-                image_single_coil = self.N.A_adjoint(
-                    y[..., ch_idx : ch_idx + 1, :, :, :]
-                )
-                # Apply adjoint of NUFFT and 1D FFT
-                x += self.C.A_adjoint(image_single_coil, channel_index=ch_idx)
-        else:
-            # Apply adjoint of kspace mask operator
-            y_masked = self.N.A_adjoint(y)
-            # Apply adjoint of NUFFT and 1D FFT
-            x = self.C.A_adjoint(y_masked)
-        return x
-
-    def A_adjoint_A(self, x: Shaped[ComplexImage3D, "*b"], **kwargs):
-        ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
-        _x = torch.zeros_like(x)
-        for ch_idx in range(ch):
-            # Apply adjoint of coil sensitivity operator and Apply adjoint of NUFFT and 1D FFT
-            y = self.N.A(self.C.A(x, channel_index=ch_idx))
-            _x += self.C.A_adjoint(self.N.A_adjoint(y), channel_index=ch_idx)
-        return _x
-
-    def A_A_adjoint(self, y, **kwargs):
-        *b, ch, kz, sp, l = y.shape
-        _y = torch.zeros_like(y)
-        for ch_idx in range(ch):
-            x = self.C.A_adjoint(
-                self.N.A_adjoint(y[..., ch_idx : ch_idx + 1, :, :, :]),
-                channel_index=ch_idx,
-            )
-            # Apply coil sensitivity operator and Apply NUFFT and 1D FFT
-            _y[..., ch_idx : ch_idx + 1, :, :, :] = self.N.A(
-                self.C.A(x, channel_index=ch_idx)
-            )
-        return _y
-
-    def grad_l2(
-        self, x: Shaped[ComplexImage3D, "*b"], y: Shaped[KspaceSpokesData, "*b ch kz"]
-    ):
-        """
-        Computes the gradient of the L2 loss function with respect to the input image.
-        Args:
-            x (Shaped[ComplexImage3D, "*b"]): Input image.
-            y (Shaped[KspaceSpokesData, "*b ch kz"]): K-space data.
-        Returns:
-            Gradient of the L2 loss function with respect to the input image.
-        """
-        ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
-        _grad = torch.zeros_like(x)
-        for ch_idx in range(ch):
-            Ax = self.N.A(self.C.A(x, channel_index=ch_idx))
-            _grad += self.C.A_adjoint(
-                self.N.A_adjoint(Ax - y[..., ch_idx : ch_idx + 1, :, :, :]),
-                channel_index=ch_idx,
-            )
-        return _grad
-
-
 class KspaceMask_kz(LinearPhysics):
     def __init__(self):
         super().__init__()
@@ -476,6 +372,146 @@ class KspaceMask(LinearPhysics):
 
     def A_adjoint(self, kspace_data):
         return kspace_data * self.kspace_mask
+
+
+class CSM_NUFFT_KspaceMASK_Combined(LinearPhysics):
+    def __init__(
+        self,
+        csm_operator=CSM_FixPh(),
+        nufft_operator=NUFFT_2D_FFT_1D(),
+        kspace_mask_operator=KspaceMask_kz(),
+        loop_over_coils=False,
+        preconditioning=False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.C = csm_operator
+        self.N = nufft_operator
+        self.M = kspace_mask_operator
+        self.loop_over_coils = loop_over_coils
+        self.preconditioning = preconditioning
+
+    def update_parameters(
+        self, kspace_traj, nufft_im_size=None, csm=None, mask=None, preconditioner=None
+    ):
+        if nufft_im_size is not None or kspace_traj is not None:
+            self.N.update_parameters(kspace_traj, nufft_im_size)
+        if csm is not None:
+            self.C.update_parameters(csm)
+        if mask is not None:
+            self.M.update_parameters(mask)
+        if preconditioner is not None and self.preconditioning:
+            self.preconditioner = preconditioner
+
+    def A(
+        self,
+        x: Shaped[ComplexImage3D, "*b"],
+    ) -> Shaped[KspaceSpokesData, "*b ch kz"]:
+        """
+        do it coil by coil
+        """
+        if self.loop_over_coils:
+            *b, d, h, w = x.shape
+            ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
+            sp, l = self.N.kspace_spoke_traj.shape[-2:]
+
+            y = torch.zeros(*b, ch, d, sp, l, dtype=x.dtype, device=x.device)
+            for ch_idx in range(ch):
+                # Apply coil sensitivity operator
+                image_single_coil = self.C.A(x, channel_index=ch_idx)
+                # Apply NUFFT and 1D FFT
+                y[..., ch_idx : ch_idx + 1, :, :, :] = self.N.A(image_single_coil)
+            # Apply kspace mask operator
+        else:
+            # Apply coil sensitivity operator
+            x_coils = self.C.A(x)
+            # Apply NUFFT and 1D FFT
+            y = self.N.A(x_coils)
+        y = self.M.A(y)
+        if self.preconditioning:
+            return self.preconditioner * y
+        else:
+            return y
+
+    def A_adjoint(
+        self,
+        y: Shaped[KspaceSpokesData, "*b ch kz"],
+    ) -> Shaped[ComplexImage3D, "*b ch"]:
+        if self.preconditioning:
+            y = y * self.preconditioner
+            y = self.M.A_adjoint(y)
+        if self.loop_over_coils:
+            *b, ch, kz, sp, l = y.shape
+            h, w = self.N.nufft_im_size
+            # batch_size = prod(b)
+            x = torch.zeros(
+                *b,
+                kz,
+                h,
+                w,
+                dtype=y.dtype,
+                device=y.device,
+            )
+            for ch_idx in range(ch):
+                image_single_coil = self.N.A_adjoint(
+                    y[..., ch_idx : ch_idx + 1, :, :, :]
+                )
+                x += self.C.A_adjoint(image_single_coil, channel_index=ch_idx)
+        else:
+            y_masked = self.N.A_adjoint(y)
+            x = self.C.A_adjoint(y_masked)
+        return x
+
+    def A_adjoint_A(self, x: Shaped[ComplexImage3D, "*b"], **kwargs):
+        ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
+        _x = torch.zeros_like(x)
+        for ch_idx in range(ch):
+            # Apply adjoint of coil sensitivity operator and Apply adjoint of NUFFT and 1D FFT
+            y = self.M.A(self.N.A(self.C.A(x, channel_index=ch_idx)))
+            if self.preconditioning:
+                y = y * self.preconditioner**2
+            _x += self.C.A_adjoint(
+                self.N.A_adjoint(self.M.A_adjoint(y)), channel_index=ch_idx
+            )
+        return _x
+
+    # def A_A_adjoint(self, y, **kwargs):
+    #     *b, ch, kz, sp, l = y.shape
+    #     _y = torch.zeros_like(y)
+    #     for ch_idx in range(ch):
+    #         x = self.C.A_adjoint(
+    #             self.N.A_adjoint(y[..., ch_idx : ch_idx + 1, :, :, :]),
+    #             channel_index=ch_idx,
+    #         )
+    #         # Apply coil sensitivity operator and Apply NUFFT and 1D FFT
+    #         _y[..., ch_idx : ch_idx + 1, :, :, :] = self.N.A(
+    #             self.C.A(x, channel_index=ch_idx)
+    #         )
+    #     return _y
+
+    # def grad_l2(
+    #     self, x: Shaped[ComplexImage3D, "*b"], y: Shaped[KspaceSpokesData, "*b ch kz"]
+    # ):
+    #     """
+    #     Computes the gradient of the L2 loss function with respect to the input image.
+    #     Args:
+    #         x (Shaped[ComplexImage3D, "*b"]): Input image.
+    #         y (Shaped[KspaceSpokesData, "*b ch kz"]): K-space data.
+    #     Returns:
+    #         Gradient of the L2 loss function with respect to the input image.
+    #     """
+    #     ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
+    #     _grad = torch.zeros_like(x)
+    #     _y = self.preconditioner * y if self.preconditioning else y
+    #     for ch_idx in range(ch):
+    #         Ax = self.M.A(self.N.A(self.C.A(x, channel_index=ch_idx)))
+    #         _grad += self.C.A_adjoint(
+    #             self.N.A_adjoint(
+    #                 self.M.A_adjoint(Ax - _y[..., ch_idx : ch_idx + 1, :, :, :])
+    #             ),
+    #             channel_index=ch_idx,
+    #         )
+    #     return _grad
 
 
 class ConjugateGradientFunction(torch.autograd.Function):

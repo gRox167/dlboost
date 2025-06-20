@@ -4,6 +4,7 @@ import deepinv as dinv
 import torch
 from deepinv.optim.data_fidelity import L2
 from deepinv.optim.optimizers import create_iterator
+from deepinv.optim.utils import least_squares
 from deepinv.physics import LinearPhysics
 from deepinv.unfolded import BaseUnfold
 from mrboost.density_compensation.area_based_radial import (
@@ -21,7 +22,7 @@ from dlboost.operators.MRI import (
     NUFFT_2D_FFT_1D,
     NUFFT_3D,
     CSM_FixPh,
-    CSM_NUFFT_Combined,
+    CSM_NUFFT_KspaceMASK_Combined,
     KspaceMask,
     KspaceMask_kz,
     MVF_Dyn,
@@ -37,11 +38,11 @@ class MR_Forward_Model(LinearPhysics):
         MVF_physics: MVF_Dyn | Repeat = MVF_Dyn((80, 320, 320)),
         CSM_physics=CSM_FixPh((1, 8, 8)),
         NUFFT_physics=NUFFT((320, 320)),
-        CSM_NUFFT_combined_physics=CSM_NUFFT_Combined(),
         KspaceMask_physics=LinearPhysics(),
-        max_iter=100,
-        tol=1e-2,
+        max_iter=8,
+        tol=2e-2,
         device=torch.device("cuda:0"),
+        preconditioning=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -54,6 +55,7 @@ class MR_Forward_Model(LinearPhysics):
         self.max_iter = max_iter
         self.tol = tol
         self.device = device
+        self.preconditioning = preconditioning
         self.weight = None
 
     def update_parameters(
@@ -63,6 +65,7 @@ class MR_Forward_Model(LinearPhysics):
         kspace_traj=None,
         kspace_mask=None,
         nufft_im_size=None,
+        preconditioner=None,
     ):
         if hasattr(self, "M") and mvf_kernels is not None:
             if isinstance(self.M, Repeat):
@@ -76,51 +79,89 @@ class MR_Forward_Model(LinearPhysics):
                     kspace_traj=kspace_traj.to(self.device),
                     nufft_im_size=nufft_im_size,
                 )
-            elif isinstance(self.N, CSM_NUFFT_Combined):
+            elif isinstance(self.N, CSM_NUFFT_KspaceMASK_Combined):
                 # CSM_NUFFT_Combined requires both kspace_traj and csm_kernels
                 self.N.update_parameters(
                     kspace_traj=kspace_traj.to(self.device),
                     nufft_im_size=nufft_im_size,
                     csm=csm_kernels.to(self.device),
+                    mask=kspace_mask.to(self.device)
+                    if kspace_mask is not None
+                    else None,
+                    preconditioner=preconditioner.to(self.device)
+                    if preconditioner is not None
+                    else None,
                 )
+                self.N.preconditioning = self.preconditioning
         if hasattr(self, "MASK") and kspace_mask is not None:
             if isinstance(self.MASK, (KspaceMask_kz, KspaceMask)):
                 # Update the mask parameters if it is a LinearPhysics object
                 # This is useful for dynamic masks or other mask types
                 self.MASK.update_parameters(kspace_mask.to(self.device))
+        if self.preconditioning and preconditioner is not None:
+            # Update the preconditioner if it is provided
+            self.preconditioner = preconditioner.to(self.device)
 
-    def A(self, image):
-        input_device = image.device
-        image = image.to(self.device)
-        return self.forward_model.A(image).to(input_device)
+    def A(self, x):
+        input_device = x.device
+        x = x.to(self.device)
+        y = self.forward_model.A(x)
+        return y.to(input_device)
 
-    def A_adjoint(self, kspace_data):
-        input_device = kspace_data.device
-        kspace_data = kspace_data.to(self.device)
-        return self.forward_model.A_adjoint(kspace_data).to(input_device)
-
-    def A_A_adjoint(self, y, **kwargs):
+    def A_adjoint(self, y):
         input_device = y.device
         y = y.to(self.device)
-        return super().A_A_adjoint(y, **kwargs).to(input_device)
+        x = self.forward_model.A_adjoint(y)
+        return x.to(input_device)
 
     def A_adjoint_A(self, x, **kwargs):
         input_device = x.device
-        x = x.to(self.device)
-        return super().A_adjoint_A(x, **kwargs).to(input_device)
+        if input_device != self.device:
+            # Ensure the input is on the correct device
+            x = x.to(self.device)
+        _x = self.M.A_adjoint(self.N.A_adjoint_A(self.M.A(x), **kwargs))
+        if input_device != self.device:
+            # Move the result back to the original device
+            _x = _x.to(input_device)
+        return _x
 
     def A_dagger(
-        self, y, solver="CG", max_iter=None, tol=None, verbose=False, **kwargs
+        self, y, init, solver="CG", max_iter=None, tol=None, verbose=False, **kwargs
     ):
         input_device = y.device
         y = y.to(self.device)
+        if max_iter is not None:
+            self.max_iter = max_iter
+        if tol is not None:
+            self.tol = tol
+        if solver is not None:
+            self.solver = solver
+        if init is not None:
+            init = init.to(self.device)
+        else:
+            if self.preconditioning:
+                # Use the preconditioned adjoint for initialization
+                init = self.A_adjoint(torch.sqrt(self.weight) * y)
+            else:
+                # Use the standard adjoint for initialization
+                init = self.A_adjoint(self.weight * y)
         with torch.no_grad():
-            results = (
-                super()
-                .A_dagger(y, solver, max_iter, tol, verbose, **kwargs)
-                .to(input_device)
+            results = least_squares(
+                self.A,
+                self.A_adjoint,
+                y,
+                init=init,
+                parallel_dim=[0],
+                AAT=self.A_A_adjoint,
+                verbose=verbose,
+                ATA=self.A_adjoint_A,
+                max_iter=self.max_iter,
+                tol=self.tol,
+                solver=self.solver,
+                **kwargs,
             )
-        return results
+        init.to(input_device)
+        return results.to(input_device)
 
     def prox_l2(
         self, z, y, gamma, solver="CG", max_iter=None, tol=None, verbose=False, **kwargs
@@ -134,10 +175,10 @@ class MR_Forward_Model(LinearPhysics):
             .to(input_device)
         )
 
-    def sequential_A(self, image):
-        input_device = image.device
-        image = image.to(self.device)
-        image_multi_phase = self.M.A(image)
+    def sequential_A(self, x):
+        input_device = x.device
+        x = x.to(self.device)
+        image_multi_phase = self.M.A(x)
         image_csm = self.S.A(image_multi_phase)
         y_unmasked = self.N.A(image_csm)
         if hasattr(self, "MASK"):
@@ -160,9 +201,9 @@ class MR_Forward_Model(LinearPhysics):
             y_unmasked = y
         image_multi_ch = self.N.A_adjoint(y_unmasked)
         image_multi_phase = self.S.A_adjoint(image_multi_ch)
-        image = self.M.A_adjoint(image_multi_phase)
+        x = self.M.A_adjoint(image_multi_phase)
         return (
-            image.to(input_device),
+            x.to(input_device),
             image_multi_phase.to(input_device),
             image_multi_ch.to(input_device),
             y_unmasked.to(input_device),
@@ -173,12 +214,10 @@ dwunet = ComplexUnet(
     1,
     1,
     spatial_dims=3,
-    # conv_net=DWUNet(
     conv_net=DWUNetSmall(
         in_channels=2,
         out_channels=2,
         features=(16, 32, 64, 128, 256),
-        # features=(32, 64, 128, 256, 512),
         strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)),
         kernel_sizes=(
             (3, 3, 3),
@@ -197,9 +236,12 @@ def custom_init(y, physics):
     if hasattr(physics, "x_init") and physics.x_init is not None:
         x_init = physics.x_init
     else:
-        # If no initial condition is provided, use the adjoint of the forward model
-        x_init = physics.A_adjoint(y * physics.weight.to(y.device))
-    return {"est": (x_init, x_init.clone())}
+        raise ValueError(
+            "Physics object must have 'x_init' attribute set to a valid tensor."
+        )
+    # _x = physics.A_dagger(y, init=x_init)
+    _x = x_init
+    return {"est": (_x, _x.clone())}
     # return {"est": (torch.zeros_like(x_init), torch.zeros_like(x_init))}
 
 
