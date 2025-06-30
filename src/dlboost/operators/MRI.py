@@ -20,7 +20,6 @@ from mrboost.computation import (
 )
 from mrboost.type_utils import (
     ComplexImage3D,
-    Image3D,
     KspaceSpokesData,
     KspaceSpokesTraj,
 )
@@ -40,7 +39,7 @@ class CSM(LinearPhysics):
         csm_str = dot_descriptor.split("->")[0].split(",")[1].strip()
         x_str = dot_descriptor.split("->")[0].split(",")[0].strip()
         y_str = dot_descriptor.split("->")[1].strip()
-        self.adjoint_dot_descriptor = f"{x_str}, {csm_str} -> {y_str}"
+        self.adjoint_dot_descriptor = f"{y_str}, {csm_str} -> {x_str}"
         self.kwargs = kwargs
 
     def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "*b ch"]):
@@ -92,7 +91,6 @@ class CSM(LinearPhysics):
                 mode="trilinear",
                 align_corners=True,
             )
-
         return einx.dot(
             self.adjoint_dot_descriptor,
             y,

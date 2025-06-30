@@ -71,20 +71,20 @@ def neg_Jdet_loss(J):
     return torch.mean(selected_neg_Jdet**2)
 
 
-def smooth_l2_loss(df):
+def smooth_l2_loss(df, dim_ratio=(1, 1, 1)):
     return (
-        ((df[:, :, 1:, :, :] - df[:, :, :-1, :, :]) ** 2).mean()
-        + ((df[:, :, :, 1:, :] - df[:, :, :, :-1, :]) ** 2).mean()
-        + ((df[:, :, :, :, 1:] - df[:, :, :, :, :-1]) ** 2).mean()
+        dim_ratio[0] * ((df[:, :, 1:, :, :] - df[:, :, :-1, :, :]) ** 2).mean()
+        + dim_ratio[1] * ((df[:, :, :, 1:, :] - df[:, :, :, :-1, :]) ** 2).mean()
+        + dim_ratio[2] * ((df[:, :, :, :, 1:] - df[:, :, :, :, :-1]) ** 2).mean()
     )
 
 
-# def magnitude_loss(all_v):
-#     all_v_x_2 = all_v[:, :, 0, :, :, :] * all_v[:, :, 0, :, :, :]
-#     all_v_y_2 = all_v[:, :, 1, :, :, :] * all_v[:, :, 1, :, :, :]
-#     all_v_z_2 = all_v[:, :, 2, :, :, :] * all_v[:, :, 2, :, :, :]
-#     all_v_magnitude = torch.mean(all_v_x_2 + all_v_y_2 + all_v_z_2)
-#     return all_v_magnitude
+def magnitude_loss(all_v):
+    all_v_x_2 = all_v[:, :, 0, :, :, :] * all_v[:, :, 0, :, :, :]
+    all_v_y_2 = all_v[:, :, 1, :, :, :] * all_v[:, :, 1, :, :, :]
+    all_v_z_2 = all_v[:, :, 2, :, :, :] * all_v[:, :, 2, :, :, :]
+    all_v_magnitude = torch.mean(all_v_x_2 + all_v_y_2 + all_v_z_2)
+    return all_v_magnitude
 
 
 class NCC(torch.nn.Module):

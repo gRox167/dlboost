@@ -63,8 +63,10 @@ class MeasurementDomainNoise2NoiseLoss(MCLoss):
         **kwargs,
     ) -> torch.Tensor:
         if self.weighted_flag:
-            y_hat = physics.weight * physics.A(x_net)
-            y = physics.weight * y
+            physics.weight = physics.weight.to(x_net.device)
+            y_hat = physics.A(x_net)
+            y_hat *= physics.weight
+            y *= physics.weight
         else:
             y_hat = physics.A(x_net)
         if self.amplitude_weight_flag:
@@ -73,8 +75,8 @@ class MeasurementDomainNoise2NoiseLoss(MCLoss):
             amplitude_weight = 1 / (
                 y_hat_detatched / norm_factor + self.amplitude_weight_epsilon
             )
-            y_hat = amplitude_weight * y_hat
-            y = amplitude_weight * y
+            y_hat *= amplitude_weight
+            y *= amplitude_weight
         return self.metric(torch.view_as_real(y_hat), torch.view_as_real(y))
 
 

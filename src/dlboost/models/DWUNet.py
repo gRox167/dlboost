@@ -9,6 +9,8 @@ from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from torch import nn
 from torch.distributions.normal import Normal
 
+from dlboost.models.SpatialTransformNetwork import warp
+
 # from dlboost.models.BasicUNet import Down
 
 
@@ -621,7 +623,7 @@ class DWUNet_Reg(nn.Module):
         out_channels: int = 3,
         strides=((2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
         kernel_sizes=((3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3), (3, 3, 3)),
-        features: Sequence[int] = (32, 64, 128, 256, 512),
+        features: Sequence[int] = (8, 16, 32, 64, 128),
         # stages = (2,2,2,2),
         act: str | tuple = ("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
         norm: str | tuple = ("instance", {"affine": True}),
@@ -653,3 +655,21 @@ class DWUNet_Reg(nn.Module):
     def forward(self, x: torch.Tensor):
         x = self.net(x)
         return self.flow(x)
+
+    def warp(self, x: torch.Tensor, flow: torch.Tensor):
+        """
+        Warp the input tensor `x` using the flow field `flow`.
+        Args:
+            x: Input tensor of shape (B, C, D, H, W) or (B, C, H, W).
+            flow: Flow field tensor of shape (B, 3, D, H, W) or (B, 3, H, W).
+        Returns:
+            Warped tensor.
+        """
+        shape = flow.shape[2:]
+        flow = flow.permute(0, 2, 3, 4, 1)
+
+        # the input range of flow is 0.5*size of image, normalize to [-1, 1]
+        for i in range(len(shape)):
+            flow[..., i] = 2 * (flow[..., i] / shape[i])
+
+        return warp(x, flow, oversample_ratio=None)

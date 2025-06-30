@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fireants.utils.imageutils import jacobian
 
 from dlboost.utils.tensor_utils import (
     GridSample3dBackward,
@@ -116,7 +115,11 @@ class CompositionTransform(nn.Module):
 
 
 def warp(
-    moving_image, displacement_field, mass_preserving=False, oversample_ratio=(2, 2, 2)
+    moving_image,
+    displacement_field,
+    mass_preserving=False,
+    oversample_ratio=(2, 2, 2),
+    direction_dim=-1,
 ):
     """
     Warps a 3D image using a displacement field.
@@ -126,52 +129,56 @@ def warp(
     Returns:
         torch.Tensor: The warped image, shape (B, C, D, H, W).
     """
-    if oversample_ratio is not None:
-        moving_image_os = F.interpolate(
-            moving_image,
-            scale_factor=oversample_ratio,
-            mode="trilinear",
+    assert displacement_field.shape[direction_dim] == 3, (
+        f"Expected displacement_field to have 3 channels at dimension {direction_dim}, but got {displacement_field.shape[direction_dim]}"
+    )
+    with torch.amp.autocast("cuda", enabled=False):
+        if oversample_ratio is not None:
+            moving_image_os = F.interpolate(
+                moving_image,
+                scale_factor=oversample_ratio,
+                mode="trilinear",
+                align_corners=True,
+            )
+            displacement_field_os = F.interpolate(
+                displacement_field.permute(
+                    0, 4, 1, 2, 3
+                ),  # move last dim to second position
+                scale_factor=oversample_ratio,
+                mode="trilinear",
+                align_corners=True,
+            ).permute(0, 2, 3, 4, 1)  # move back to original order
+        else:
+            moving_image_os = moving_image
+            displacement_field_os = displacement_field
+        # new locations
+        grid = F.affine_grid(
+            torch.eye(3, 4, device=moving_image_os.device)[None],
+            (1, 1) + moving_image_os.shape[2:],
             align_corners=True,
         )
-        displacement_field_os = F.interpolate(
-            displacement_field.permute(
-                0, 4, 1, 2, 3
-            ),  # move last dim to second position
-            scale_factor=oversample_ratio,
-            mode="trilinear",
-            align_corners=True,
-        ).permute(0, 2, 3, 4, 1)  # move back to original order
-    else:
-        moving_image_os = moving_image
-        displacement_field_os = displacement_field
-    # new locations
-    grid = F.affine_grid(
-        torch.eye(3, 4, device=moving_image_os.device)[None],
-        (1, 1) + moving_image_os.shape[2:],
-        align_corners=True,
-    )
-    warped_coordinates = grid + displacement_field_os
-    moved_image_os = F.grid_sample(
-        moving_image_os, warped_coordinates, "bilinear", align_corners=True
-    )
-    if mass_preserving:
-        J = J = jacobian(warped_coordinates, normalize=True).permute(0, 2, 3, 4, 1, 5)[
-            :, 1:-1, 1:-1, 1:-1, :
-        ]
-        Jdet = torch.linalg.det(J)
-        # if mass preserving, we need to scale the image by the inverse of determinant of the Jacobian
-        moved_image_os[:, :, 1:-1, 1:-1, 1:-1] /= Jdet.unsqueeze(1) + 1e-6
-    if oversample_ratio is not None:
-        # interpolate back to original resolution
-        moved_image = F.interpolate(
-            moved_image_os,
-            scale_factor=tuple(1 / s for s in oversample_ratio),
-            mode="trilinear",
-            align_corners=True,
+        warped_coordinates = grid + displacement_field_os
+        moved_image_os = F.grid_sample(
+            moving_image_os, warped_coordinates, "bilinear", align_corners=True
         )
-    else:
-        moved_image = moved_image_os
-    return moved_image
+        if oversample_ratio is not None:
+            # interpolate back to original resolution
+            moved_image = F.interpolate(
+                moved_image_os,
+                scale_factor=tuple(1 / s for s in oversample_ratio),
+                mode="trilinear",
+                align_corners=True,
+            )
+        else:
+            moved_image = moved_image_os
+        return moved_image
+    # if mass_preserving:
+    #     J = J = jacobian(warped_coordinates, normalize=True).permute(0, 2, 3, 4, 1, 5)[
+    #         :, 1:-1, 1:-1, 1:-1, :
+    #     ]
+    #     Jdet = torch.linalg.det(J)
+    #     # if mass preserving, we need to scale the image by the inverse of determinant of the Jacobian
+    #     moved_image_os[:, :, 1:-1, 1:-1, 1:-1] /= Jdet.unsqueeze(1) + 1e-6
     # return GridSample3dForward.apply(moving_image, warped_coordinates, True)
 
     # warped_coordinates = einx.rearrange(

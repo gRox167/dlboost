@@ -1,7 +1,6 @@
 import deepinv as dinv
 import torch
 from deepinv.loss import Loss
-from icecream import ic
 
 
 class UNSURE(Loss):
@@ -81,7 +80,7 @@ class UNSURE(Loss):
             gain = 0.0
 
         if self.kernel_size > 1:
-            b = (
+            Mb = (
                 dinv.physics.functional.conv2d(
                     b, (self.sigma + gain), padding="circular"
                 )
@@ -91,17 +90,17 @@ class UNSURE(Loss):
                 )
             )
         else:
-            b *= self.sigma + gain
+            Mb = b * (self.sigma + gain)
 
         y2 = physics.A(model(y + b * self.tau, physics))
 
         if self.pinv:
-            diff = physics.A_dagger(b) * physics.A_dagger(y2 - y1) / self.tau
+            diff = 2 * Mb * physics.A_dagger(b) * physics.A_dagger(y2 - y1) / self.tau
         else:
-            diff = (b * (y2 - y1)) / self.tau
+            diff = 2 * Mb * (b * (y2 - y1)) / self.tau
         if torch.is_complex(diff):
             diff = torch.view_as_real(diff)
-        div = 2 * diff.reshape(y.size(0), -1).mean(1)
+        div = diff.reshape(y.size(0), -1).mean(1)
 
         if self.mode == "gaussian" or self.mode == "poisson_gaussian":
             self.gradient_step_sigma(div.mean())
@@ -118,8 +117,8 @@ class UNSURE(Loss):
             else:
                 residual = (y1 - y).pow(2).reshape(y.size(0), -1).mean(1)
 
-        ic(residual)
-        ic(div)
+        # ic(residual)
+        # ic(div)
 
         loss = div + residual
         return loss
@@ -307,4 +306,3 @@ class ScoreModel(torch.nn.Module):
 
     def get_error(self):
         return self.error
-

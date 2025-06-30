@@ -94,6 +94,27 @@ def complex_as_real_2ch(x):
     return einx.rearrange("b ch ... cmplx-> b (ch cmplx) ...", torch.view_as_real(x))
 
 
+def tensor_memory(tensor: torch.Tensor, verbose: bool = True, unit="GB") -> float:
+    """
+    Returns the memory usage of a tensor in megabytes (MB).
+    """
+    if verbose:
+        print(
+            f"Tensor shape: {tensor.shape}, "
+            f"element size: {tensor.element_size()} bytes, "
+            f"number of elements: {tensor.nelement()}"
+        )
+    if unit == "GB":
+        size = tensor.element_size() * tensor.nelement() / (1024**3)
+    elif unit == "MB":
+        size = tensor.element_size() * tensor.nelement() / (1024**2)
+    elif unit == "KB":
+        size = tensor.element_size() * tensor.nelement() / (1024**1)
+    if verbose:
+        print(f"Tensor memory usage: {size:.2f} {unit}")
+    return size
+
+
 def real_2ch_as_complex(x, ch=1):
     return torch.view_as_complex(
         einx.rearrange(

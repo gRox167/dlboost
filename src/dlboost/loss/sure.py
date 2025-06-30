@@ -205,7 +205,9 @@ class SureGaussianLoss(Loss):
             diff = torch.view_as_real(diff)
 
         mse = diff.pow(2).reshape(y.size(0), -1).mean(1)
-        loss_sure = mse + div  # - self.sigma2
+        loss_sure = mse + div - self.sigma2
+        print(f"mse: {mse.mean().item()}")
+        print(f"div: {div.mean().item()}")
 
         if self.unsure:  # update the estimate of the noise level
             self.sigma2, self.grad_sigma, self.init_flag = unsure_gradient_step(

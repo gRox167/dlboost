@@ -68,7 +68,7 @@ class MR_Forward_Model(LinearPhysics):
         preconditioner=None,
     ):
         if hasattr(self, "M") and mvf_kernels is not None:
-            if isinstance(self.M, Repeat):
+            if not isinstance(self.M, Repeat):
                 self.M.update_parameters(mvf_kernels.to(self.device))
         if hasattr(self, "S") and csm_kernels is not None:
             if isinstance(self.S, (CSM_FixPh, CSM)):
@@ -82,9 +82,13 @@ class MR_Forward_Model(LinearPhysics):
             elif isinstance(self.N, CSM_NUFFT_KspaceMASK_Combined):
                 # CSM_NUFFT_Combined requires both kspace_traj and csm_kernels
                 self.N.update_parameters(
-                    kspace_traj=kspace_traj.to(self.device),
-                    nufft_im_size=nufft_im_size,
-                    csm=csm_kernels.to(self.device),
+                    kspace_traj=kspace_traj.to(self.device)
+                    if kspace_traj is not None
+                    else None,
+                    nufft_im_size=nufft_im_size if nufft_im_size is not None else None,
+                    csm=csm_kernels.to(self.device)
+                    if csm_kernels is not None
+                    else None,
                     mask=kspace_mask.to(self.device)
                     if kspace_mask is not None
                     else None,
