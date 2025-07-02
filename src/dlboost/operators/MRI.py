@@ -6,6 +6,10 @@ import torch
 from deepinv.optim.utils import least_squares
 from deepinv.physics import LinearPhysics, adjoint_function
 from dlboost.models.SpatialTransformNetwork import warp
+from dlboost.operators.csm_autograd_function import (
+    CSMAdjointFunctionNoSave,
+    CSMFunctionNoSave,
+)
 from dlboost.utils.tensor_utils import interpolate
 from jaxtyping import Shaped
 from mrboost.computation import (
@@ -23,6 +27,7 @@ from mrboost.type_utils import (
     KspaceSpokesData,
     KspaceSpokesTraj,
 )
+from torch import Tensor
 from torchopt.linear_solve import solve_cg
 
 
@@ -51,7 +56,14 @@ class CSM(LinearPhysics):
         """
         self._csm = csm_kernels
 
-    def A(
+    def A(self, x: Tensor, channel_index: int | None = None, **kwargs):
+        # Use our custom forward function that does not store the full coil sensitivity map.
+        return CSMFunctionNoSave.apply(x, self._csm, self, channel_index)
+
+    def A_adjoint(self, y: Tensor, channel_index: int | None = None, **kwargs):
+        return CSMAdjointFunctionNoSave.apply(y, self._csm, self, channel_index)
+
+    def _A(
         self,
         x: Shaped[ComplexImage3D, "*b"],
         channel_index: int | None = None,
@@ -74,7 +86,7 @@ class CSM(LinearPhysics):
             _csm_ch,
         )
 
-    def A_adjoint(
+    def _A_adjoint(
         self,
         y: Shaped[ComplexImage3D, "*b ch"],
         channel_index: int | None = None,
@@ -436,12 +448,11 @@ class CSM_NUFFT_KspaceMASK_Combined(LinearPhysics):
         y: Shaped[KspaceSpokesData, "*b ch kz"],
     ) -> Shaped[ComplexImage3D, "*b ch"]:
         if self.preconditioning:
-            y = y * self.preconditioner
+            y *= self.preconditioner
             y = self.M.A_adjoint(y)
         if self.loop_over_coils:
             *b, ch, kz, sp, l = y.shape
             h, w = self.N.nufft_im_size
-            # batch_size = prod(b)
             x = torch.zeros(
                 *b,
                 kz,
@@ -467,7 +478,7 @@ class CSM_NUFFT_KspaceMASK_Combined(LinearPhysics):
             # Apply adjoint of coil sensitivity operator and Apply adjoint of NUFFT and 1D FFT
             y = self.M.A(self.N.A(self.C.A(x, channel_index=ch_idx)))
             if self.preconditioning:
-                y = y * self.preconditioner**2
+                y *= self.preconditioner**2
             _x += self.C.A_adjoint(
                 self.N.A_adjoint(self.M.A_adjoint(y)), channel_index=ch_idx
             )
