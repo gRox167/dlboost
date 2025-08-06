@@ -20,12 +20,10 @@ class CSMFunctionNoSave(torch.autograd.Function):
             _csm = csm[..., channel_index : channel_index + 1, :, :, :]
         else:
             _csm = csm
-        if operator.scale_factor is not None:
+        if operator.interpolation_parameters is not None:
             _csm = interpolate(
                 _csm,
-                scale_factor=operator.scale_factor,
-                mode="trilinear",
-                align_corners=True,
+                **operator.interpolation_parameters,
             )
         # compute the forward pass
         out = einx.dot(operator.dot_descriptor, x, _csm)
@@ -46,12 +44,10 @@ class CSMFunctionNoSave(torch.autograd.Function):
         csm = operator._csm
         if channel_index is not None:
             csm = csm[..., channel_index : channel_index + 1, :, :, :]
-        if operator.scale_factor is not None:
+        if operator.interpolation_parameters is not None:
             csm = interpolate(
                 csm,
-                scale_factor=operator.scale_factor,
-                mode="trilinear",
-                align_corners=True,
+                **operator.interpolation_parameters,
             )
 
         # grad for x is computed from the adjoint operation

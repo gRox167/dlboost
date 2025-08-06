@@ -28,26 +28,34 @@ from mrboost.type_utils import (
     KspaceSpokesTraj,
 )
 from torch import Tensor
-from torchopt.linear_solve import solve_cg
 
 
 class CSM(LinearPhysics):
     def __init__(
         self,
-        scale_factor: Tuple[int, int, int] | None = (1, 8, 8),
+        interpolation_parameters: Dict | None = {
+            "size": (244, 288, 288),
+            "align_corners": True,
+            "mode": "trilinear",
+        },
         dot_descriptor: str = "b ... d h w, b ch d h w -> b ... ch d h w",
         **kwargs,
     ):
         super().__init__()
-        self.scale_factor = scale_factor
+        self.interpolation_parameters = interpolation_parameters
         self.dot_descriptor = dot_descriptor
-        csm_str = dot_descriptor.split("->")[0].split(",")[1].strip()
-        x_str = dot_descriptor.split("->")[0].split(",")[0].strip()
-        y_str = dot_descriptor.split("->")[1].strip()
+        arg_list = dot_descriptor.split("->")
+        csm_str = arg_list[0].split(",")[1].strip()
+        x_str = arg_list[0].split(",")[0].strip()
+        y_str = arg_list[1].strip()
         self.adjoint_dot_descriptor = f"{y_str}, {csm_str} -> {x_str}"
         self.kwargs = kwargs
 
-    def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "*b ch"]):
+    def update_parameters(
+        self,
+        csm_kernels: Shaped[ComplexImage3D, "*b ch"],
+        interpolation_parameters=None,
+    ):
         """
         Update the coil sensitivity maps (CSM) kernels.
         Args:
@@ -55,133 +63,94 @@ class CSM(LinearPhysics):
             we assume that the CSM are in the shape of (..., channels, depth, height, width).
         """
         self._csm = csm_kernels
+        if interpolation_parameters is not None:
+            self.interpolation_parameters.update(interpolation_parameters)
 
+    # @torch.compile
     def A(self, x: Tensor, channel_index: int | None = None, **kwargs):
         # Use our custom forward function that does not store the full coil sensitivity map.
         return CSMFunctionNoSave.apply(x, self._csm, self, channel_index)
 
+    # @torch.compile
     def A_adjoint(self, y: Tensor, channel_index: int | None = None, **kwargs):
         return CSMAdjointFunctionNoSave.apply(y, self._csm, self, channel_index)
 
-    def _A(
-        self,
-        x: Shaped[ComplexImage3D, "*b"],
-        channel_index: int | None = None,
-        **kwargs,
-    ):
-        if channel_index is not None:
-            _csm_ch = self._csm[..., channel_index : channel_index + 1, :, :, :]
-        else:
-            _csm_ch = self._csm
-        if self.scale_factor is not None:
-            _csm_ch = interpolate(
-                _csm_ch,
-                scale_factor=self.scale_factor,
-                mode="trilinear",
-                align_corners=True,
-            )
-        return einx.dot(
-            self.dot_descriptor,
-            x,
-            _csm_ch,
-        )
 
-    def _A_adjoint(
-        self,
-        y: Shaped[ComplexImage3D, "*b ch"],
-        channel_index: int | None = None,
-        **kwargs,
-    ):
-        if channel_index is not None:
-            _csm_ch = self._csm[..., channel_index : channel_index + 1, :, :, :]
-        else:
-            _csm_ch = self._csm
-        if self.scale_factor is not None:
-            _csm_ch = interpolate(
-                _csm_ch,
-                scale_factor=self.scale_factor,
-                mode="trilinear",
-                align_corners=True,
-            )
-        return einx.dot(
-            self.adjoint_dot_descriptor,
-            y,
-            _csm_ch.conj(),
-            **self.kwargs,
-        )
-
-
-class CSM_FixPh(LinearPhysics):
+class CSM_FixPh(CSM):
     def __init__(
         self,
-        scale_factor: Tuple[int, int, int] | None = (1, 8, 8),
-        # compute_device="cuda",
-        # storage_device="cpu",
+        interpolation_parameters: Dict[str, int] | None = None,
+        *args,
+        **kwargs,
     ):
         super().__init__()
-        self.scale_factor = scale_factor
+        self.interpolation_parameters = interpolation_parameters
 
     def update_parameters(self, csm_kernels: Shaped[ComplexImage3D, "b ch"]):
         if self.scale_factor is not None:
-            self._csm = interpolate(
-                csm_kernels, scale_factor=self.scale_factor, mode="trilinear"
-            )
+            self._csm = interpolate(csm_kernels, **self.interpolation_parameters)
         else:
             self._csm = csm_kernels
 
-    def A(self, image: Shaped[ComplexImage3D, "b ph"]):
-        return einx.dot("b ph ..., b ch ... -> b ph ch ...", image, self._csm)
+    @torch.compile
+    def A(self, x: Shaped[ComplexImage3D, "b ph"], channel_index=None, **kwargs):
+        if torch.is_complex(x):
+            x = torch.complex(x)
+        return einx.dot("b ph ..., b ch ... -> b ph ch ...", x, self._csm)
 
-    def A_adjoint(self, image_multi_ch: Shaped[ComplexImage3D, "b ph ch"], **kwargs):
-        return einx.dot(
-            "b ph ch ..., b ch ...-> b ph ...", image_multi_ch, self._csm.conj()
-        )
+    @torch.compile
+    def A_adjoint(
+        self, y: Shaped[ComplexImage3D, "b ph ch"], channel_index=None, **kwargs
+    ):
+        return einx.dot("b ph ch ..., b ch ...-> b ph ...", y, self._csm.conj())
 
 
 class MVF_Dyn(LinearPhysics):
     def __init__(self, scale_factor: Tuple[int, int, int] | None = (1, 2, 2)):
         super().__init__()
         self.scale_factor = scale_factor
-        self.rescale_factor = (
-            1 / scale_factor[0],
-            1 / scale_factor[1],
-            1 / scale_factor[2],
-        )
+        if scale_factor is not None:
+            self.rescale_factor = (
+                1 / scale_factor[0],
+                1 / scale_factor[1],
+                1 / scale_factor[2],
+            )
         # self.spatial_transform = SpatialTransformNetwork(size=size, mode="bilinear")
 
     def update_parameters(self, mvf_kernels: Shaped[torch.Tensor, "b ph d h w v"]):
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):  # type: ignore
             self._mvf = mvf_kernels
             # batches, self.ph_to_move, v, d, h, w = self._mvf.shape
             batches, self.ph_to_move, d, h, w, v = self._mvf.shape
             self.norm_factor = torch.sqrt(
                 torch.tensor(self.ph_to_move + 1, device=self._mvf.device)
             )
-            d, h, w = (
-                round(d * self.rescale_factor[0]),
-                round(h * self.rescale_factor[1]),
-                round(w * self.rescale_factor[2]),
-            )
+            if self.scale_factor is not None:
+                d, h, w = (
+                    round(d * self.rescale_factor[0]),
+                    round(h * self.rescale_factor[1]),
+                    round(w * self.rescale_factor[2]),
+                )
             self.A_adjoint_func = adjoint_function(
                 self.A,
                 # (batches, self.ph_to_move + 1, d, h, w),
                 (batches, d, h, w),
-                device=self._mvf.device,
+                device=self._mvf.device,  # type: ignore
                 dtype=torch.complex64,
             )
 
-    def A(self, image: Shaped[ComplexImage3D, "b"]):
-        with torch.amp.autocast("cuda", enabled=False):
+    def A(self, x: Shaped[ComplexImage3D, "b"]):
+        with torch.amp.autocast("cuda", enabled=False):  # type: ignore
             if self.scale_factor is not None:
-                image = interpolate(
-                    image.unsqueeze(1),
+                x = interpolate(
+                    x.unsqueeze(1),
                     scale_factor=self.scale_factor,
                     mode="trilinear",
                     align_corners=True,
                 ).squeeze(1)
             image_moving = einx.rearrange(
                 "b d h w cmplx-> (b ph) cmplx d h w",
-                torch.view_as_real(image),
+                torch.view_as_real(x),
                 ph=self.ph_to_move,
             )
 
@@ -195,11 +164,11 @@ class MVF_Dyn(LinearPhysics):
                     image_moved,
                     cmplx=2,
                     ph=self.ph_to_move,
-                ).contiguous()
+                ).contiguous()  # type: ignore
             )
             images = einx.rearrange(
                 "b d h w, b ph d h w -> b (1 + ph) d h w",
-                image,
+                x,
                 image_moved,
             )
             if self.scale_factor is not None:
@@ -218,7 +187,7 @@ class MVF_Dyn(LinearPhysics):
 
 class Repeat(LinearPhysics):
     def __init__(
-        self, pattern: str = "b d h w -> d ph d h w", repeats: Dict = {"ph": 5}
+        self, pattern: str = "b d h w -> b ph d h w", repeats: Dict = {"ph": 5}
     ):
         super().__init__()
         self.pattern = pattern
@@ -246,15 +215,22 @@ class Repeat(LinearPhysics):
 
 
 class NUFFT(LinearPhysics):
-    def __init__(self, nufft_im_size):
+    def __init__(self):
         super().__init__()
-        self.nufft_im_size = nufft_im_size
 
-    def update_parameters(self, kspace_traj):
-        self.kspace_traj = kspace_traj
+    def update_parameters(self, kspace_traj, nufft_im_size=None):
+        if nufft_im_size is not None:
+            self.nufft_im_size = nufft_im_size
+        if kspace_traj is not None:
+            self.spoke_len = kspace_traj.shape[-1]
+            self.kspace_spoke_traj = kspace_traj
+            self.kspace_traj = radial_spokes_to_kspace_point(kspace_traj)
 
-    def A(self, image):
-        return nufft_2d(
+    def A(
+        self,
+        image: Shaped[ComplexImage3D, "*b ch"],
+    ) -> Shaped[KspaceSpokesData, "*b ch kz"]:
+        _kxkyz = nufft_2d(
             image,
             self.kspace_traj,
             self.nufft_im_size,
@@ -262,8 +238,14 @@ class NUFFT(LinearPhysics):
             # use this line if you have RO oversampling
             # norm_factor=np.sqrt(np.prod(self.nufft_im_size)),
         )
+        return kspace_point_to_radial_spokes(_kxkyz, self.spoke_len)
 
-    def A_adjoint(self, kspace_data):
+    def A_adjoint(
+        self,
+        kspace_data: Shaped[KspaceSpokesData, "*b ch kz"],
+    ) -> Shaped[ComplexImage3D, "*b ch"]:
+        kspace_data = radial_spokes_to_kspace_point(kspace_data)
+
         return nufft_adj_2d(
             kspace_data,
             self.kspace_traj,
@@ -279,8 +261,13 @@ class NUFFT_3D(LinearPhysics):
         super().__init__()
         self.nufft_im_size = nufft_im_size
 
-    def update_parameters(self, kspace_traj):
-        self.kspace_traj = kspace_traj
+    def update_parameters(self, kspace_traj, nufft_im_size=None):
+        if nufft_im_size is not None:
+            self.nufft_im_size = nufft_im_size
+        if kspace_traj is not None:
+            self.spoke_len = kspace_traj.shape[-1]
+            self.kspace_spoke_traj = kspace_traj
+            self.kspace_traj = radial_spokes_to_kspace_point(kspace_traj)
 
     def A(self, image):
         output = nufft_3d(
@@ -358,11 +345,13 @@ class KspaceMask_kz(LinearPhysics):
         if kspace_mask is not None:
             self.kspace_mask = kspace_mask
 
+    @torch.compile
     def A(self, kspace_data: Shaped[KspaceSpokesData, "... kz"]):
         return einx.dot(
             "... kz sp len, kz -> ... kz sp len", kspace_data, self.kspace_mask
         )
 
+    @torch.compile
     def A_adjoint(self, kspace_data: Shaped[KspaceSpokesData, "... kz"]):
         return einx.dot(
             "... kz sp len, kz -> ... kz sp len", kspace_data, self.kspace_mask
@@ -425,7 +414,7 @@ class CSM_NUFFT_KspaceMASK_Combined(LinearPhysics):
             ch = self.C._csm.shape[-4]  # Number of coils (ch d h w)
             sp, l = self.N.kspace_spoke_traj.shape[-2:]
 
-            y = torch.zeros(*b, ch, d, sp, l, dtype=x.dtype, device=x.device)
+            y = torch.zeros(*b, ch, d, sp, l, dtype=torch.complex64, device=x.device)
             for ch_idx in range(ch):
                 # Apply coil sensitivity operator
                 image_single_coil = self.C.A(x, channel_index=ch_idx)
@@ -476,11 +465,11 @@ class CSM_NUFFT_KspaceMASK_Combined(LinearPhysics):
         _x = torch.zeros_like(x)
         for ch_idx in range(ch):
             # Apply adjoint of coil sensitivity operator and Apply adjoint of NUFFT and 1D FFT
-            y = self.M.A(self.N.A(self.C.A(x, channel_index=ch_idx)))
+            _y = self.M.A(self.N.A(self.C.A(x, channel_index=ch_idx)))
             if self.preconditioning:
-                y *= self.preconditioner**2
+                _y *= self.preconditioner**2
             _x += self.C.A_adjoint(
-                self.N.A_adjoint(self.M.A_adjoint(y)), channel_index=ch_idx
+                self.N.A_adjoint(self.M.A_adjoint(_y)), channel_index=ch_idx
             )
         return _x
 
@@ -521,56 +510,6 @@ class CSM_NUFFT_KspaceMASK_Combined(LinearPhysics):
     #             channel_index=ch_idx,
     #         )
     #     return _grad
-
-
-class ConjugateGradientFunction(torch.autograd.Function):
-    @staticmethod
-    def setup_context(ctx, A, b, x_init, max_iter, rtol):
-        """
-        Args:
-            ctx: Context to save tensors for backward pass.
-        """
-        ctx.A = A
-        ctx.max_iter = max_iter
-        ctx.rtol = rtol
-        ctx.save_for_backward(b)  # Save tensors that require grad
-
-    @staticmethod
-    def forward(A, b, x_init, rtol=1e-5, max_iter=100):
-        """
-        Solves a batch of linear systems A[i]x[i] = b[i] using conjugate gradient.
-
-        Args:
-            A: A callable for batched matrix-vector product.
-            b: A tensor of right-hand sides, shape (batch_size, n).
-            tol: Tolerance for the stopping criterion.
-            max_iter: Maximum number of iterations.
-
-        Returns:
-            x: Solution tensor, shape (batch_size, n).
-        """
-        solver = solve_cg(init=x_init)
-        x = solver(A, b, rtol=rtol, max_iter=max_iter)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """
-        Computes the gradient of the output with respect to the inputs.
-
-        Args:
-            ctx: Context with saved tensors from forward.
-            grad_output: Gradient of the loss with respect to the output, shape (batch_size, n).
-
-        Returns:
-            Gradients with respect to A, b, tol, and max_iter.
-        """
-        b = ctx.saved_tensors[0]
-        grad_b = None
-        if ctx.needs_input_grad[1]:  # Gradient w.r.t. b
-            solver = solve_cg(init=b)
-            grad_b = solver(ctx.A, grad_output, rtol=ctx.rtol, max_iter=ctx.max_iter)
-        return (None, grad_b, None, None, None)
 
 
 class RadialVibePhysics(LinearPhysics):
