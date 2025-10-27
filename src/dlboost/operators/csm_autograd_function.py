@@ -13,7 +13,7 @@ class CSMFunctionNoSave(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x: Tensor, csm: Tensor, operator: LinearPhysics, channel_index=None
+        ctx, x: Tensor, csm: Tensor, operator: LinearPhysics, channel_index=None,
     ):
         # Do not save csm (reduce memory)
         if channel_index is not None:
@@ -59,6 +59,12 @@ class CSMFunctionNoSave(torch.autograd.Function):
                 csm.conj(),
                 **operator.kwargs,
             )
+            # grad_x = einx.divide(
+            #     operator.adjoint_dot_descriptor,
+            #     grad_output,
+            #     csm,
+            #     **operator.kwargs,
+            # )
 
         grad_csm = None
         if ctx.needs_input_grad[1]:
@@ -70,6 +76,8 @@ class CSMFunctionNoSave(torch.autograd.Function):
             x_saved = x  # x was saved if needed
             x_c = x_saved.conj().unsqueeze(x_saved.dim() - 3)
             grad_csm_full = grad_output * x_c
+            # x_c = x_saved.unsqueeze(x_saved.dim() - 3)
+            # grad_csm_full = grad_output / x_c
             if x_saved.dim() > 4:
                 sum_dims = tuple(range(1, x_saved.dim() - 3))
                 grad_csm = grad_csm_full.sum(dim=sum_dims)
@@ -93,12 +101,10 @@ class CSMAdjointFunctionNoSave(torch.autograd.Function):
             _csm = csm[..., channel_index : channel_index + 1, :, :, :]
         else:
             _csm = csm
-        if operator.scale_factor is not None:
+        if operator.interpolation_parameters is not None:
             _csm = interpolate(
                 _csm,
-                scale_factor=operator.scale_factor,
-                mode="trilinear",
-                align_corners=True,
+                **operator.interpolation_parameters,
             )
         out = einx.dot(
             operator.adjoint_dot_descriptor, y, _csm.conj(), **operator.kwargs
@@ -119,12 +125,10 @@ class CSMAdjointFunctionNoSave(torch.autograd.Function):
         csm = operator._csm
         if channel_index is not None:
             csm = csm[..., channel_index : channel_index + 1, :, :, :]
-        if operator.scale_factor is not None:
+        if operator.interpolation_parameters is not None:
             csm = interpolate(
                 csm,
-                scale_factor=operator.scale_factor,
-                mode="trilinear",
-                align_corners=True,
+                **operator.interpolation_parameters,
             )
 
         grad_y = None
